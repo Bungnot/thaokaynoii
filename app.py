@@ -135,6 +135,25 @@ def process_slip_async(user_id: str, image_data: bytes):
 
         if status == 200:
             trans_ref = result.get("data", {}).get("transRef", "")
+            payment = result.get("data", {})
+
+            # ตรวจสอบว่าโอนมาที่บัญชีของเราหรือเปล่า
+            OUR_ACCOUNT = "0748441328"
+            receiver_account = payment.get("receiver", {}).get("account", {}).get("value", "")
+            receiver_account_clean = receiver_account.replace("-", "").replace(" ", "")
+            if OUR_ACCOUNT not in receiver_account_clean:
+                line_bot_api.push_message(
+                    PushMessageRequest(
+                        to=user_id,
+                        messages=[TextMessage(text=(
+                            "❌ สลิปนี้ไม่ได้โอนมายังบัญชีของเรา\n\n"
+                            f"🏦 บัญชีผู้รับในสลิป: {receiver_account}\n\n"
+                            "กรุณาโอนเงินมาที่บัญชีของเราเท่านั้น\n"
+                            "พิมพ์ \'บช\' เพื่อดูเลขบัญชีที่ถูกต้อง"
+                        ))],
+                    )
+                )
+                return
 
             if trans_ref and is_slip_used(trans_ref):
                 line_bot_api.push_message(
