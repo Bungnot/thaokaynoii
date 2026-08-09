@@ -420,7 +420,7 @@ def success_flex(data: dict) -> dict:
                 },
                 {
                     "type": "text",
-                    "text": "ตรวจสอบกับ EasySlip API V2 สำเร็จ",
+                    "text": "หมานๆนะสมาชิก",
                     "size": "sm",
                     "color": "#7A8C94",
                     "margin": "sm",
