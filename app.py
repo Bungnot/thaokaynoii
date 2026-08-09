@@ -303,6 +303,54 @@ def is_admin_uid(uid: str) -> bool:
             conn.close()
 
 
+
+def list_admins_persistent():
+    """
+    คืนค่ารายชื่อแอดมินจาก SQLite:
+    [(uid, display_name), ...]
+    """
+    conn = None
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT
+                a.uid,
+                COALESCE(
+                    NULLIF(a.display_name, ''),
+                    NULLIF(u.display_name, ''),
+                    ''
+                ) AS display_name
+            FROM bot_admins a
+            LEFT JOIN line_users u ON u.uid = a.uid
+            ORDER BY
+                CASE WHEN COALESCE(NULLIF(a.display_name, ''), NULLIF(u.display_name, ''), '') = ''
+                     THEN 1 ELSE 0 END,
+                display_name COLLATE NOCASE,
+                a.created_at
+            """
+        )
+        rows = cur.fetchall()
+        cur.close()
+
+        result = []
+        for row in rows:
+            uid = str(row["uid"] or "").strip()
+            name = str(row["display_name"] or "").strip()
+            if uid:
+                result.append((uid, name))
+        return result
+
+    except Exception as exc:
+        print("[DB] list admins error:", exc)
+        return []
+
+    finally:
+        if conn:
+            conn.close()
+
+
 def add_admin_persistent(uid: str, display_name: str, added_by: str):
     """
     เพิ่มแอดมินลง SQLite บน Railway Volume
@@ -1852,6 +1900,48 @@ def handle_text(event: dict):
         return
 
 
+
+
+    # ====== คำสั่ง "เช็คแอดมิน" ======
+    # ใช้ได้เฉพาะแอดมิน
+    if re.fullmatch(r"(เช็คแอดมิน|เช็กแอดมิน)", text.strip(), re.IGNORECASE):
+        if not is_admin:
+            reply_line(
+                reply_token,
+                [text_message("⛔ คำสั่งนี้ใช้ได้เฉพาะแอดมินเท่านั้น")]
+            )
+            return
+
+        admins = list_admins_persistent()
+
+        if not admins:
+            reply_line(
+                reply_token,
+                [text_message("📋 ยังไม่พบรายชื่อแอดมินในระบบ")]
+            )
+            return
+
+        lines = [
+            "👑 รายชื่อแอดมินทั้งหมด",
+            f"ทั้งหมด {len(admins)} คน",
+            "━━━━━━━━━━━━━━"
+        ]
+
+        for i, (admin_uid, admin_name) in enumerate(admins, start=1):
+            display = admin_name or "ไม่ทราบชื่อ"
+            lines.append(
+                f"{i}. {display}\n"
+                f"   🆔 {admin_uid}"
+            )
+
+        lines.append("━━━━━━━━━━━━━━")
+        lines.append("💾 เก็บถาวรใน Railway Volume")
+
+        reply_line(
+            reply_token,
+            [text_message("\n".join(lines))]
+        )
+        return
 
     # ====== คำสั่ง "เพิ่มแอด @ชื่อไลน์" ======
     # ใช้ได้เฉพาะแอดมินปัจจุบัน
