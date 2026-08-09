@@ -2,6 +2,9 @@ import os
 import hmac
 import hashlib
 import base64
+import re
+import csv
+import threading
 from datetime import datetime
 
 import requests
@@ -37,6 +40,39 @@ MAX_IMAGE_BYTES = 4 * 1024 * 1024
 # Optional Railway PostgreSQL for a second duplicate-protection layer
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
+# =========================
+# PEH / เปะ (เฉพาะฟีเจอร์นี้จากไฟล์อ้างอิง)
+# =========================
+_DEFAULT_ADMIN_UIDS = {
+    "U255dd67c1fef32fb0eae127149c7cadc",
+    "Uf7e207bfdd69d8e41806436fa7a86c14",
+    "U163186c5013c8f1e4820291b7b1d86bd",
+    "Uc2013ea8397da6d19cbe0f931a04c949",
+    "U2f156aa5effee7c1ee349b9320a35381"
+}
+
+# ถ้าตั้ง ADMIN_UIDS ใน Railway จะใช้ค่าจาก Railway แทนค่าเดิม
+# รูปแบบ: Uxxxx,Uyyyy,Uzzzz
+_admin_env = os.getenv("ADMIN_UIDS", "").strip()
+ADMIN_UIDS = (
+    {uid.strip() for uid in _admin_env.split(",") if uid.strip()}
+    if _admin_env
+    else _DEFAULT_ADMIN_UIDS
+)
+
+PEH_LIST = {}   # dict[source_key] = ["ข้อความ..."]
+TARGET_GROUP_NAME = os.getenv(
+    "TARGET_GROUP_NAME",
+    "🚀บั้งไฟน้อย 10% • เถ้าแก่น้อย •"
+).strip()
+
+
+
+# =========================
+# UID directory / รายชื่อผู้ที่เคยทักบอท
+# =========================
+USERS_TXT_PATH = os.path.join(os.path.dirname(__file__), "oa_users.txt")
+_USERS_LOCK = threading.Lock()
 
 # =========================
 # Optional PostgreSQL
@@ -420,7 +456,7 @@ def success_flex(data: dict) -> dict:
                 },
                 {
                     "type": "text",
-                    "text": "หมานๆนะสมาชิก",
+                    "text": "ตรวจสอบกับ EasySlip API V2 สำเร็จ",
                     "size": "sm",
                     "color": "#7A8C94",
                     "margin": "sm",
@@ -642,6 +678,165 @@ def error_flex(code: str, detail: str = "") -> dict:
     }
 
 
+
+
+# =========================
+# UID helpers
+# =========================
+def _line_get_json(url: str):
+    """GET LINE profile endpoint และคืน dict; ถ้าพลาดคืน {}"""
+    try:
+        resp = requests.get(
+            url,
+            headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"},
+            timeout=10,
+        )
+        if resp.ok:
+            return resp.json()
+        print("[LINE] profile lookup failed:", resp.status_code, resp.text[:300])
+    except Exception as exc:
+        print("[LINE] profile lookup error:", exc)
+    return {}
+
+
+def _display_name_from_event(event: dict) -> str:
+    """
+    ดึง displayName ของผู้ส่ง
+    - กลุ่ม: group member profile
+    - room: room member profile
+    - แชทส่วนตัว: profile
+    """
+    source = event.get("source") or {}
+    user_id = source.get("userId")
+    if not user_id:
+        return ""
+
+    source_type = source.get("type")
+    group_id = source.get("groupId")
+    room_id = source.get("roomId")
+
+    if source_type == "group" and group_id:
+        data = _line_get_json(
+            f"https://api.line.me/v2/bot/group/{group_id}/member/{user_id}"
+        )
+    elif source_type == "room" and room_id:
+        data = _line_get_json(
+            f"https://api.line.me/v2/bot/room/{room_id}/member/{user_id}"
+        )
+    else:
+        data = _line_get_json(
+            f"https://api.line.me/v2/bot/profile/{user_id}"
+        )
+
+    return str(data.get("displayName") or "").strip()
+
+
+def _load_users_txt() -> dict:
+    """อ่าน oa_users.txt คืนค่า dict[uid] = display_name"""
+    data = {}
+    if not os.path.exists(USERS_TXT_PATH):
+        return data
+
+    try:
+        with open(USERS_TXT_PATH, "r", encoding="utf-8", newline="") as f:
+            reader = csv.reader(f, delimiter="\t")
+            for row in reader:
+                if not row:
+                    continue
+                uid = row[0].strip()
+                name = row[1].strip() if len(row) > 1 else ""
+                if uid:
+                    data[uid] = name
+    except Exception as exc:
+        print("[UID] load error:", exc)
+
+    return data
+
+
+def _save_user_to_txt(uid: str, display_name: str):
+    """บันทึก/อัปเดต UID และชื่อแบบ atomic"""
+    if not uid:
+        return
+
+    display_name = display_name or ""
+
+    with _USERS_LOCK:
+        data = _load_users_txt()
+
+        if data.get(uid) == display_name:
+            return
+
+        data[uid] = display_name
+        tmp_path = USERS_TXT_PATH + ".tmp"
+
+        try:
+            with open(tmp_path, "w", encoding="utf-8", newline="") as f:
+                writer = csv.writer(f, delimiter="\t")
+                for saved_uid in sorted(data.keys()):
+                    writer.writerow([saved_uid, data[saved_uid]])
+
+            os.replace(tmp_path, USERS_TXT_PATH)
+        except Exception as exc:
+            print("[UID] save error:", exc)
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
+
+
+def _search_uid_by_name(name_query: str, limit: int = 10):
+    """ค้นชื่อแบบ partial match ไม่สนตัวพิมพ์เล็กใหญ่"""
+    query = (name_query or "").strip().casefold()
+    if not query:
+        return []
+
+    data = _load_users_txt()
+    results = []
+
+    for uid, name in data.items():
+        if query in (name or "").casefold():
+            results.append((uid, name))
+        if len(results) >= limit:
+            break
+
+    return results
+
+
+# =========================
+# PEH helpers
+# =========================
+def _source_key(event: dict) -> str:
+    source = event.get("source") or {}
+    return (
+        source.get("groupId")
+        or source.get("roomId")
+        or source.get("userId")
+        or "global"
+    )
+
+
+def _add_peh_item(event: dict, text: str) -> str:
+    key = _source_key(event)
+
+    if key not in PEH_LIST:
+        PEH_LIST[key] = []
+
+    PEH_LIST[key].append(text)
+
+    header = (
+        f"{TARGET_GROUP_NAME}\n"
+        f"สกอบั้งไฟวันนี้\n"
+        f"{'-' * 25}"
+    )
+
+    lines = []
+    for i, item in enumerate(PEH_LIST[key], start=1):
+        lines.append(f"{i}. {item}")
+
+    return header + "\n" + "\n".join(lines)
+
+
 # =========================
 # Event handlers
 # =========================
@@ -649,8 +844,104 @@ def handle_text(event: dict):
     text = str(((event.get("message") or {}).get("text") or "")).strip()
     reply_token = event.get("replyToken")
 
+    source = event.get("source") or {}
+    user_id = source.get("userId")
+    is_admin = user_id in ADMIN_UIDS
+
+
+    # ====== UID / ค้น UID ======
+
+    # เก็บ UID + ชื่อของทุกคนที่พิมพ์ข้อความเข้ามาหาบอท
+    if user_id:
+        try:
+            display_name = _display_name_from_event(event)
+            _save_user_to_txt(user_id, display_name)
+        except Exception as exc:
+            print("[UID] capture error:", exc)
+
+    # คำสั่ง "uid" = ดู UID ตัวเอง
+    if text.lower() == "uid":
+        reply_line(
+            reply_token,
+            [text_message(f"🔍 UID ของคุณคือ:\n{user_id or 'ไม่พบ UID'}")]
+        )
+        return
+
+    # คำสั่ง "@ชื่อไลน์ uid" = แอดมินค้น UID ของคนที่บอทเคยเห็น
+    m_uid_lookup = re.match(r"^@(.+?)\s+uid$", text, re.IGNORECASE)
+    if m_uid_lookup:
+        if not is_admin:
+            reply_line(
+                reply_token,
+                [text_message("⛔ คำสั่งค้น UID ของผู้อื่นใช้ได้เฉพาะแอดมิน")]
+            )
+            return
+
+        query_name = m_uid_lookup.group(1).strip()
+        matches = _search_uid_by_name(query_name, limit=10)
+
+        if not matches:
+            reply_line(
+                reply_token,
+                [text_message(
+                    f"ไม่พบชื่อที่ตรงกับ “{query_name}” ในระบบ\n"
+                    "หมายเหตุ: บอทจะค้นได้เฉพาะคนที่เคยส่งข้อความในแชท/กลุ่มที่บอทอยู่"
+                )]
+            )
+            return
+
+        if len(matches) == 1:
+            uid_found, name_found = matches[0]
+            reply_line(
+                reply_token,
+                [text_message(
+                    f"🔍 UID ของ {name_found or 'ไม่ทราบชื่อ'} คือ:\n{uid_found}"
+                )]
+            )
+            return
+
+        lines = [f"พบหลายคนที่ชื่อคล้าย “{query_name}”:"]
+        for uid_found, name_found in matches:
+            lines.append(f"• {name_found or '(ไม่มีชื่อ)'}\n  {uid_found}")
+
+        reply_line(reply_token, [text_message("\n".join(lines))])
+        return
+
+
+    # ====== PEH / "เปะ" (เฉพาะแอดมิน) ======
+    # รองรับทั้ง 1 บรรทัด:
+    #   เปะ ข้อความ
+    #
+    # และหลายบรรทัดในข้อความเดียว:
+    #   เปะ รายการแรก
+    #   เปะ รายการที่สอง
+    if is_admin and "เปะ" in text:
+        lines = text.split("\n")
+        added = False
+        final_output = None
+
+        for line in lines:
+            m = re.match(r"^เปะ\s+(.+)$", line.strip())
+            if m:
+                item_text = m.group(1).strip()
+                final_output = _add_peh_item(event, item_text)
+                added = True
+
+        if added:
+            reply_line(reply_token, [text_message(final_output)])
+            return
+
+    # ====== ล้างรายการ PEH (เฉพาะแอดมิน) ======
+    if text == "ล้างรายการ" and is_admin:
+        key = _source_key(event)
+        PEH_LIST[key] = []
+        reply_line(reply_token, [text_message("ล้างรายการเรียบร้อย")])
+        return
+
+    # ====== คำสั่งเดิม ======
     if text == "บช":
         reply_line(reply_token, [text_message(ACCOUNT_MESSAGE)])
+        return
 
 
 def handle_image(event: dict):
@@ -778,5 +1069,5 @@ def webhook():
 init_db()
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
+    port = int(os.getenv("PORT", "8080"))
     app.run(host="0.0.0.0", port=port)
