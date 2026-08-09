@@ -879,6 +879,41 @@ def _peh_parse_status(item: str):
     return symbol, display_text
 
 
+
+def _peh_split_row(display_text: str, symbol: str | None):
+    """
+    แยกข้อความสำหรับแสดงในตาราง:
+      "เทสระบบ3 320 ✅✅"
+    เป็น
+      left  = "เทสระบบ3"
+      right = "320 ✅✅"
+
+    รองรับตัวเลขเช่น 320, 1,250, 320.50
+    ถ้าไม่พบตัวเลขท้ายข้อความ จะให้ข้อความทั้งหมดอยู่ฝั่งซ้าย
+    และ emoji อยู่ฝั่งขวา
+    """
+    text = str(display_text or "").strip()
+
+    # ตัด emoji สถานะออกชั่วคราว เพื่อหาเลขท้าย
+    clean = re.sub(r"[✅❌⛔]+", "", text)
+    clean = re.sub(r"\s+", " ", clean).strip()
+
+    m = re.match(r"^(.*?)(?:\s+)([-+]?\d[\d,]*(?:\.\d+)?)$", clean)
+
+    emoji_text = ""
+    if symbol:
+        count = min(2, max(1, text.count(symbol)))
+        emoji_text = symbol * count
+
+    if m:
+        left = m.group(1).strip()
+        amount = m.group(2).strip()
+        right = f"{amount} {emoji_text}".strip()
+        return left, right
+
+    return clean, emoji_text
+
+
 def _peh_build_stats(items):
     stats = {"win": 0, "lose": 0, "draw": 0}
     parsed_items = []
@@ -923,21 +958,25 @@ def _peh_stat_cell(title: str, value: int, emoji: str) -> dict:
 
 def _peh_row(number: int, display_text: str, symbol: str | None) -> dict:
     """
-    แถวรายการแบบ compact เพื่อให้รองรับ 70-80 รายการได้สบาย
-    ใช้พื้นขาว + เส้นแบ่งบาง ลด JSON และลดความรก
+    ตารางแบบมือถือ:
+      [ลำดับ] [ชื่อ/ข้อความ]                         [ตัวเลข + emoji]
+
+    ตัวเลขยอดและ emoji จะชิดขวาสุดของตาราง
     """
-    # สีเลขลำดับตามผล แบบอ่อน ไม่แสบตา
     number_color = {
         "✅": "#15803D",
         "❌": "#B91C1C",
         "⛔": "#A16207",
     }.get(symbol, "#60717C")
 
+    left_text, right_text = _peh_split_row(display_text, symbol)
+
     return {
         "type": "box",
         "layout": "horizontal",
         "paddingTop": "5px",
         "paddingBottom": "5px",
+        "alignItems": "center",
         "contents": [
             {
                 "type": "text",
@@ -950,14 +989,27 @@ def _peh_row(number: int, display_text: str, symbol: str | None) -> dict:
             },
             {
                 "type": "text",
-                "text": display_text,
+                "text": left_text,
                 "size": "xs",
                 "color": "#24313A",
                 "wrap": True,
-                "flex": 9,
+                "gravity": "center",
+                "flex": 6,
+            },
+            {
+                "type": "text",
+                "text": right_text,
+                "size": "xs",
+                "weight": "bold",
+                "color": "#24313A",
+                "align": "end",
+                "gravity": "center",
+                "flex": 3,
+                "wrap": False,
             },
         ],
     }
+
 
 
 def _peh_page_bubble(page_items, page_no: int, page_total: int, stats: dict, total: int):
@@ -1220,6 +1272,22 @@ def handle_text(event: dict):
         reply_line(reply_token, [text_message("\n".join(lines))])
         return
 
+
+
+    # ====== คำสั่ง "สกอ" ดูรายการทั้งหมด ======
+    # ทุกคนในห้อง/กลุ่มสามารถดูสกอของห้องนั้นได้
+    if text == "สกอ":
+        key = _source_key(event)
+        if not PEH_LIST.get(key):
+            reply_line(
+                reply_token,
+                [text_message("📋 ยังไม่มีรายการเปะในห้องนี้")]
+            )
+            return
+
+        # peh_flex_messages จะจัด 20 รายการ/หน้าให้อัตโนมัติ
+        reply_line(reply_token, peh_flex_messages(event))
+        return
 
     # ====== PEH / "เปะ" (เฉพาะแอดมิน) ======
     # รองรับทั้ง 1 บรรทัด:
