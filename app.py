@@ -1015,7 +1015,8 @@ def _peh_row(number: int, display_text: str, symbol: str | None) -> dict:
 def _peh_page_bubble(page_items, page_no: int, page_total: int, stats: dict, total: int):
     """
     1 bubble = 1 หน้า
-    ดีไซน์เน้นพื้นขาว อ่านง่าย รองรับหลายสิบรายการ
+    - หน้า 1: แสดงหัว + สรุป ชนะ/แพ้/จาว
+    - หน้า 2 เป็นต้นไป: แสดงเฉพาะหัว + เลขหน้า + รายการ
     """
     rows = []
 
@@ -1023,11 +1024,10 @@ def _peh_page_bubble(page_items, page_no: int, page_total: int, stats: dict, tot
         global_no = (page_no - 1) * PEH_ITEMS_PER_PAGE + idx + 1
         rows.append(_peh_row(global_no, display_text, symbol))
 
-        # เส้นแบ่งระหว่างรายการ
         if idx != len(page_items) - 1:
             rows.append({
                 "type": "separator",
-                "color": "#EEF1F3",
+                "color": "#EEF2F4",
             })
 
     if not rows:
@@ -1035,84 +1035,183 @@ def _peh_page_bubble(page_items, page_no: int, page_total: int, stats: dict, tot
             "type": "text",
             "text": "ยังไม่มีรายการ",
             "size": "sm",
-            "color": "#8A969E",
+            "color": "#94A3AB",
             "align": "center",
             "margin": "lg",
         }]
 
-    return {
-        "type": "bubble",
-        "size": "mega",
-        "header": {
+    # -------------------------
+    # Header ทุกหน้า
+    # -------------------------
+    header_contents = [
+        {
             "type": "box",
-            "layout": "vertical",
-            "backgroundColor": "#FFFFFF",
-            "paddingStart": "12px",
-            "paddingEnd": "12px",
-            "paddingTop": "10px",
-            "paddingBottom": "6px",
+            "layout": "horizontal",
+            "alignItems": "center",
             "contents": [
                 {
-                    "type": "text",
-                    "text": "สกอบั้งไฟวันนี้",
-                    "size": "md",
-                    "weight": "bold",
-                    "color": "#1E2A32",
+                    "type": "box",
+                    "layout": "vertical",
+                    "width": "5px",
+                    "height": "26px",
+                    "cornerRadius": "8px",
+                    "backgroundColor": "#62B89B",
+                    "contents": []
                 },
                 {
                     "type": "box",
-                    "layout": "horizontal",
+                    "layout": "vertical",
                     "margin": "sm",
+                    "flex": 1,
                     "contents": [
+                        {
+                            "type": "text",
+                            "text": "สกอบั้งไฟวันนี้",
+                            "size": "md",
+                            "weight": "bold",
+                            "color": "#26353D",
+                        },
                         {
                             "type": "text",
                             "text": f"ทั้งหมด {total} รายการ",
                             "size": "xxs",
-                            "color": "#7A8790",
-                            "flex": 1,
+                            "color": "#8B989F",
+                            "margin": "xs",
                         },
-                        {
-                            "type": "text",
-                            "text": f"หน้า {page_no}/{page_total}",
-                            "size": "xxs",
-                            "color": "#7A8790",
-                            "align": "end",
-                            "flex": 1,
-                        },
-                    ],
+                    ]
                 },
                 {
-                    "type": "separator",
-                    "margin": "md",
-                    "color": "#E7ECEF",
-                },
-                {
-                    "type": "box",
-                    "layout": "horizontal",
-                    "margin": "sm",
-                    "contents": [
-                        _peh_stat_cell("ชนะ", stats["win"], "✅"),
-                        {
-                            "type": "separator",
-                            "color": "#EEF1F3",
-                        },
-                        _peh_stat_cell("แพ้", stats["lose"], "❌"),
-                        {
-                            "type": "separator",
-                            "color": "#EEF1F3",
-                        },
-                        _peh_stat_cell("จาว", stats["draw"], "⛔"),
-                    ],
+                    "type": "text",
+                    "text": f"หน้า {page_no}/{page_total}",
+                    "size": "xxs",
+                    "color": "#9AA5AB",
+                    "align": "end",
+                    "gravity": "center",
+                    "flex": 0,
                 },
             ],
+        }
+    ]
+
+    # -------------------------
+    # สรุปผล แสดงเฉพาะหน้า 1
+    # -------------------------
+    if page_no == 1:
+        header_contents += [
+            {
+                "type": "box",
+                "layout": "horizontal",
+                "spacing": "sm",
+                "margin": "md",
+                "contents": [
+                    {
+                        "type": "box",
+                        "layout": "vertical",
+                        "flex": 1,
+                        "cornerRadius": "10px",
+                        "backgroundColor": "#F1FAF5",
+                        "paddingAll": "7px",
+                        "contents": [
+                            {
+                                "type": "text",
+                                "text": "ชนะ",
+                                "size": "xxs",
+                                "color": "#708078",
+                                "align": "center",
+                            },
+                            {
+                                "type": "text",
+                                "text": f"✅ {stats['win']}",
+                                "size": "sm",
+                                "weight": "bold",
+                                "color": "#267A55",
+                                "align": "center",
+                                "margin": "xs",
+                            },
+                        ],
+                    },
+                    {
+                        "type": "box",
+                        "layout": "vertical",
+                        "flex": 1,
+                        "cornerRadius": "10px",
+                        "backgroundColor": "#FFF5F5",
+                        "paddingAll": "7px",
+                        "contents": [
+                            {
+                                "type": "text",
+                                "text": "แพ้",
+                                "size": "xxs",
+                                "color": "#857474",
+                                "align": "center",
+                            },
+                            {
+                                "type": "text",
+                                "text": f"❌ {stats['lose']}",
+                                "size": "sm",
+                                "weight": "bold",
+                                "color": "#B84A4A",
+                                "align": "center",
+                                "margin": "xs",
+                            },
+                        ],
+                    },
+                    {
+                        "type": "box",
+                        "layout": "vertical",
+                        "flex": 1,
+                        "cornerRadius": "10px",
+                        "backgroundColor": "#FFF9EF",
+                        "paddingAll": "7px",
+                        "contents": [
+                            {
+                                "type": "text",
+                                "text": "จาว",
+                                "size": "xxs",
+                                "color": "#837A68",
+                                "align": "center",
+                            },
+                            {
+                                "type": "text",
+                                "text": f"⛔ {stats['draw']}",
+                                "size": "sm",
+                                "weight": "bold",
+                                "color": "#9A711F",
+                                "align": "center",
+                                "margin": "xs",
+                            },
+                        ],
+                    },
+                ],
+            }
+        ]
+
+    header_contents.append({
+        "type": "separator",
+        "margin": "md",
+        "color": "#E8EDF0",
+    })
+
+    return {
+        "type": "bubble",
+        "size": "giga",
+        "header": {
+            "type": "box",
+            "layout": "vertical",
+            "backgroundColor": "#FFFFFF",
+            "paddingStart": "14px",
+            "paddingEnd": "14px",
+            "paddingTop": "12px",
+            "paddingBottom": "7px",
+            "contents": header_contents,
         },
         "body": {
             "type": "box",
             "layout": "vertical",
             "backgroundColor": "#FFFFFF",
-            "paddingStart": "12px",
-            "paddingEnd": "12px",
-            "paddingTop": "2px",
+            "paddingStart": "14px",
+            "paddingEnd": "14px",
+            "paddingTop": "3px",
             "paddingBottom": "8px",
             "contents": rows,
         },
@@ -1126,13 +1225,14 @@ def _peh_page_bubble(page_items, page_no: int, page_total: int, stats: dict, tot
                     "type": "text",
                     "text": TARGET_GROUP_NAME,
                     "size": "xxs",
-                    "color": "#8A969E",
+                    "color": "#98A4AA",
                     "align": "center",
                     "wrap": True,
                 }
             ],
         },
     }
+
 
 
 def peh_flex_messages(event: dict) -> list:
@@ -1200,6 +1300,47 @@ def peh_flex_messages(event: dict) -> list:
         })
 
     return messages
+
+
+
+# =========================
+# FLEX ปุ่มส่งสลิป สำหรับคำสั่ง "บช"
+# =========================
+SLIP_SEND_URL = "https://page.line.me/812anmhp"
+
+
+def account_send_slip_flex() -> dict:
+    """
+    FLEX ขนาดเล็กสำหรับส่งต่อหลังข้อความเลขบัญชี
+    กดแล้วเปิด LINE OA ตามลิงก์ที่กำหนด
+    """
+    return {
+        "type": "flex",
+        "altText": "📤 ส่งสลิปที่นี่",
+        "contents": {
+            "type": "bubble",
+            "size": "nano",
+            "body": {
+                "type": "box",
+                "layout": "vertical",
+                "backgroundColor": "#FFFFFF",
+                "paddingAll": "10px",
+                "contents": [
+                    {
+                        "type": "button",
+                        "style": "primary",
+                        "height": "sm",
+                        "color": "#06C755",
+                        "action": {
+                            "type": "uri",
+                            "label": "📤 ส่งสลิปที่นี่",
+                            "uri": SLIP_SEND_URL
+                        }
+                    }
+                ]
+            }
+        }
+    }
 
 
 # =========================
@@ -1320,7 +1461,13 @@ def handle_text(event: dict):
 
     # ====== คำสั่งเดิม ======
     if text == "บช":
-        reply_line(reply_token, [text_message(ACCOUNT_MESSAGE)])
+        reply_line(
+            reply_token,
+            [
+                text_message(ACCOUNT_MESSAGE),
+                account_send_slip_flex()
+            ]
+        )
         return
 
 
