@@ -92,13 +92,15 @@ def get_db():
 
 def init_db():
     if not DATABASE_URL:
-        print("[DB] DATABASE_URL not set. Using EasySlip duplicate checking only.")
+        print("[DB] DATABASE_URL not set. Persistent admins are disabled.")
         return
 
     conn = None
     try:
         conn = get_db()
         cur = conn.cursor()
+
+        # สลิปที่ใช้แล้ว
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS used_slips (
@@ -114,9 +116,51 @@ def init_db():
             )
             """
         )
+
+        # รายชื่อ LINE ที่บอทเคยพบ เก็บใน PostgreSQL เพื่อไม่หายหลัง reboot/redeploy
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS line_users (
+                uid TEXT PRIMARY KEY,
+                display_name TEXT NOT NULL DEFAULT '',
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            )
+            """
+        )
+
+        # แอดมินที่เพิ่มจากคำสั่ง "เพิ่มแอด @ชื่อไลน์"
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS bot_admins (
+                uid TEXT PRIMARY KEY,
+                display_name TEXT NOT NULL DEFAULT '',
+                added_by TEXT,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            )
+            """
+        )
+
+        # Seed แอดมินเดิมจาก ADMIN_UIDS / ค่า default เข้า DB
+        for uid in ADMIN_UIDS:
+            cur.execute(
+                """
+                INSERT INTO bot_admins (uid, display_name, added_by)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (uid) DO NOTHING
+                """,
+                (uid, "", "bootstrap"),
+            )
+
+        # โหลดแอดมินถาวรจาก DB เข้า memory
+        cur.execute("SELECT uid FROM bot_admins")
+        for row in cur.fetchall():
+            if row and row[0]:
+                ADMIN_UIDS.add(str(row[0]).strip())
+
         conn.commit()
         cur.close()
-        print("[DB] used_slips table ready.")
+
+        print(f"[DB] tables ready. admins loaded: {len(ADMIN_UIDS)}")
     except Exception as exc:
         print("[DB] init error:", exc)
         if conn:
@@ -124,6 +168,162 @@ def init_db():
     finally:
         if conn:
             conn.close()
+
+
+def _upsert_line_user_db(uid: str, display_name: str):
+    """เก็บ UID + ชื่อใน PostgreSQL เพื่อให้ค้นหาได้แม้ bot reboot/redeploy"""
+    if not DATABASE_URL or not uid:
+        return
+
+    conn = None
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO line_users (uid, display_name, updated_at)
+            VALUES (%s, %s, NOW())
+            ON CONFLICT (uid)
+            DO UPDATE SET
+                display_name = EXCLUDED.display_name,
+                updated_at = NOW()
+            """,
+            (uid, display_name or ""),
+        )
+        conn.commit()
+        cur.close()
+    except Exception as exc:
+        print("[DB] line_users upsert error:", exc)
+        if conn:
+            conn.rollback()
+    finally:
+        if conn:
+            conn.close()
+
+
+def _search_users_db(name_query: str, limit: int = 10):
+    """ค้น UID จาก display name ใน PostgreSQL"""
+    if not DATABASE_URL:
+        return []
+
+    query = (name_query or "").strip()
+    if not query:
+        return []
+
+    conn = None
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT uid, display_name
+            FROM line_users
+            WHERE display_name ILIKE %s
+            ORDER BY updated_at DESC
+            LIMIT %s
+            """,
+            (f"%{query}%", limit),
+        )
+        rows = cur.fetchall()
+        cur.close()
+        return [(str(uid), str(name or "")) for uid, name in rows]
+    except Exception as exc:
+        print("[DB] user search error:", exc)
+        return []
+    finally:
+        if conn:
+            conn.close()
+
+
+def is_admin_uid(uid: str) -> bool:
+    """
+    ตรวจสิทธิ์แอดมิน
+    - เช็ก memory ก่อน
+    - ถ้าไม่พบ จะเช็ก PostgreSQL เพื่อรองรับหลาย worker / หลัง reboot
+    """
+    if not uid:
+        return False
+
+    if uid in ADMIN_UIDS:
+        return True
+
+    if not DATABASE_URL:
+        return False
+
+    conn = None
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM bot_admins WHERE uid = %s LIMIT 1", (uid,))
+        found = cur.fetchone() is not None
+        cur.close()
+
+        if found:
+            ADMIN_UIDS.add(uid)
+
+        return found
+    except Exception as exc:
+        print("[DB] admin lookup error:", exc)
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+
+def add_admin_persistent(uid: str, display_name: str, added_by: str):
+    """
+    เพิ่มแอดมินถาวรลง PostgreSQL
+    return: (ok, already_exists, message)
+    """
+    if not DATABASE_URL:
+        return (
+            False,
+            False,
+            "ยังไม่ได้ตั้ง DATABASE_URL จึงยังเก็บแอดมินแบบถาวรไม่ได้"
+        )
+
+    if not uid:
+        return False, False, "ไม่พบ UID ของผู้ใช้"
+
+    conn = None
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+
+        cur.execute(
+            "SELECT 1 FROM bot_admins WHERE uid = %s LIMIT 1",
+            (uid,),
+        )
+        already = cur.fetchone() is not None
+
+        cur.execute(
+            """
+            INSERT INTO bot_admins (uid, display_name, added_by)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (uid)
+            DO UPDATE SET
+                display_name = EXCLUDED.display_name
+            """,
+            (uid, display_name or "", added_by or ""),
+        )
+
+        conn.commit()
+        cur.close()
+
+        # ใช้งานได้ทันทีใน worker ปัจจุบัน
+        ADMIN_UIDS.add(uid)
+
+        return True, already, "OK"
+    except Exception as exc:
+        if conn:
+            conn.rollback()
+        print("[DB] add admin error:", exc)
+        return False, False, str(exc)
+    finally:
+        if conn:
+            conn.close()
+
+
 
 
 def claim_trans_ref(data: dict) -> bool:
@@ -784,23 +984,97 @@ def _save_user_to_txt(uid: str, display_name: str):
             except Exception:
                 pass
 
+    # เก็บลง PostgreSQL อีกชั้น เพื่อไม่หายหลัง reboot/redeploy
+    _upsert_line_user_db(uid, display_name)
+
 
 def _search_uid_by_name(name_query: str, limit: int = 10):
-    """ค้นชื่อแบบ partial match ไม่สนตัวพิมพ์เล็กใหญ่"""
-    query = (name_query or "").strip().casefold()
+    """ค้นชื่อจาก PostgreSQL ก่อน แล้ว fallback ไป oa_users.txt"""
+    raw_query = (name_query or "").strip()
+    query = raw_query.casefold()
+
     if not query:
         return []
 
-    data = _load_users_txt()
     results = []
+    seen = set()
 
-    for uid, name in data.items():
-        if query in (name or "").casefold():
+    # 1) PostgreSQL (ถาวร)
+    for uid, name in _search_users_db(raw_query, limit=limit):
+        if uid not in seen:
             results.append((uid, name))
+            seen.add(uid)
+        if len(results) >= limit:
+            return results
+
+    # 2) local txt fallback
+    data = _load_users_txt()
+    for uid, name in data.items():
+        if query in (name or "").casefold() and uid not in seen:
+            results.append((uid, name))
+            seen.add(uid)
         if len(results) >= limit:
             break
 
     return results
+
+
+def _extract_mentioned_user_ids(event: dict):
+    """
+    ดึง userId จาก LINE mention metadata
+    รองรับกรณีแอดมินใช้ @mention จริงในกลุ่ม
+    """
+    message = event.get("message") or {}
+    mention = message.get("mention") or {}
+    mentionees = mention.get("mentionees") or []
+
+    user_ids = []
+    for item in mentionees:
+        if item.get("type") != "user":
+            continue
+
+        # ไม่เอา mention ที่ชี้มาที่ตัว bot เอง
+        if item.get("isSelf") is True:
+            continue
+
+        uid = str(item.get("userId") or "").strip()
+        if uid and uid not in user_ids:
+            user_ids.append(uid)
+
+    return user_ids
+
+
+def _display_name_for_uid(event: dict, target_uid: str) -> str:
+    """พยายามอ่านชื่อ LINE ของ UID เป้าหมายจากบริบทห้อง/กลุ่ม"""
+    if not target_uid:
+        return ""
+
+    source = event.get("source") or {}
+    source_type = source.get("type")
+    group_id = source.get("groupId")
+    room_id = source.get("roomId")
+
+    if source_type == "group" and group_id:
+        data = _line_get_json(
+            f"https://api.line.me/v2/bot/group/{group_id}/member/{target_uid}"
+        )
+    elif source_type == "room" and room_id:
+        data = _line_get_json(
+            f"https://api.line.me/v2/bot/room/{room_id}/member/{target_uid}"
+        )
+    else:
+        data = _line_get_json(
+            f"https://api.line.me/v2/bot/profile/{target_uid}"
+        )
+
+    name = str(data.get("displayName") or "").strip()
+
+    if name:
+        _save_user_to_txt(target_uid, name)
+
+    return name
+
+
 
 
 # =========================
@@ -1352,7 +1626,7 @@ def handle_text(event: dict):
 
     source = event.get("source") or {}
     user_id = source.get("userId")
-    is_admin = user_id in ADMIN_UIDS
+    is_admin = is_admin_uid(user_id)
 
 
     # ====== UID / ค้น UID ======
@@ -1413,6 +1687,126 @@ def handle_text(event: dict):
         reply_line(reply_token, [text_message("\n".join(lines))])
         return
 
+
+
+    # ====== คำสั่ง "เพิ่มแอด @ชื่อไลน์" ======
+    # ใช้ได้เฉพาะแอดมินปัจจุบัน
+    if re.match(r"^เพิ่มแอด(?:\s+|$)", text, re.IGNORECASE):
+        if not is_admin:
+            reply_line(
+                reply_token,
+                [text_message("⛔ คำสั่งเพิ่มแอดมิน ใช้ได้เฉพาะแอดมินเท่านั้น")]
+            )
+            return
+
+        if not DATABASE_URL:
+            reply_line(
+                reply_token,
+                [text_message(
+                    "⚠️ ยังเพิ่มแอดมินแบบถาวรไม่ได้\n"
+                    "กรุณาเพิ่ม Railway PostgreSQL และตั้ง DATABASE_URL ก่อน\n"
+                    "เพื่อให้รายชื่อแอดมินไม่หายหลัง reboot/redeploy"
+                )]
+            )
+            return
+
+        target_uid = None
+        target_name = ""
+
+        # วิธีที่ 1: ใช้ @mention จริงของ LINE — แม่นที่สุด
+        mentioned_uids = _extract_mentioned_user_ids(event)
+        if mentioned_uids:
+            target_uid = mentioned_uids[0]
+            target_name = _display_name_for_uid(event, target_uid)
+
+        # วิธีที่ 2: ถ้าไม่มี mention metadata ให้ค้นจากชื่อที่บอทเคยเก็บ
+        if not target_uid:
+            m_add_admin = re.match(
+                r"^เพิ่มแอด\s+@(.+?)\s*$",
+                text,
+                re.IGNORECASE
+            )
+
+            if not m_add_admin:
+                reply_line(
+                    reply_token,
+                    [text_message(
+                        "รูปแบบคำสั่ง:\n"
+                        "เพิ่มแอด @ชื่อไลน์\n\n"
+                        "แนะนำให้กด @mention สมาชิกจริงในกลุ่ม"
+                    )]
+                )
+                return
+
+            query_name = m_add_admin.group(1).strip()
+            matches = _search_uid_by_name(query_name, limit=10)
+
+            if not matches:
+                reply_line(
+                    reply_token,
+                    [text_message(
+                        f"❌ ไม่พบชื่อ “{query_name}” ในระบบ\n"
+                        "ให้สมาชิกคนนั้นพิมพ์ข้อความในกลุ่ม/แชทที่บอทอยู่ก่อน "
+                        "หรือใช้ @mention จริงแล้วลองใหม่"
+                    )]
+                )
+                return
+
+            if len(matches) > 1:
+                lines = [
+                    f"⚠️ พบชื่อคล้าย “{query_name}” หลายคน",
+                    "กรุณา @mention คนที่ต้องการเพิ่มโดยตรง:"
+                ]
+                for uid_found, name_found in matches[:5]:
+                    lines.append(
+                        f"• {name_found or '(ไม่มีชื่อ)'}  ({uid_found[:8]}…)"
+                    )
+
+                reply_line(
+                    reply_token,
+                    [text_message("\n".join(lines))]
+                )
+                return
+
+            target_uid, target_name = matches[0]
+
+        # กันกรณีเพิ่มตัวเอง/คนเดิมซ้ำ (ยังตอบได้ปกติ)
+        if not target_name:
+            target_name = _display_name_for_uid(event, target_uid) or "ไม่ทราบชื่อ"
+
+        ok, already, result_msg = add_admin_persistent(
+            target_uid,
+            target_name,
+            user_id,
+        )
+
+        if not ok:
+            reply_line(
+                reply_token,
+                [text_message(
+                    "❌ เพิ่มแอดมินไม่สำเร็จ\n"
+                    f"{result_msg}"
+                )]
+            )
+            return
+
+        if already:
+            reply_text = (
+                "ℹ️ คนนี้เป็นแอดมินอยู่แล้ว\n"
+                f"👤 {target_name}\n"
+                f"🆔 {target_uid}"
+            )
+        else:
+            reply_text = (
+                "✅ เพิ่มแอดมินถาวรเรียบร้อย\n"
+                f"👤 {target_name}\n"
+                f"🆔 {target_uid}\n\n"
+                "ข้อมูลถูกเก็บใน PostgreSQL แล้ว "
+                "รีบอทหรือ Redeploy รายชื่อก็ไม่หาย"
+            )
+
+        reply_line(reply_token, [text_message(reply_text)])
+        return
 
 
     # ====== คำสั่ง "สกอ" ดูรายการทั้งหมด ======
