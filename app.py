@@ -5,6 +5,7 @@ import base64
 import re
 import csv
 import threading
+import sqlite3
 from datetime import datetime
 
 import requests
@@ -37,8 +38,20 @@ VERIFY_MATCH_ACCOUNT = os.getenv("VERIFY_MATCH_ACCOUNT", "true").lower() == "tru
 # Maximum image size supported by EasySlip V2 = 4 MB
 MAX_IMAGE_BYTES = 4 * 1024 * 1024
 
-# Optional Railway PostgreSQL for a second duplicate-protection layer
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+# Railway Volume + SQLite
+# Railway จะสร้าง RAILWAY_VOLUME_MOUNT_PATH ให้อัตโนมัติเมื่อ Volume ถูก mount กับ service
+VOLUME_MOUNT_PATH = os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
+HAS_RAILWAY_VOLUME = bool(VOLUME_MOUNT_PATH)
+
+# ถ้ารัน local ให้ fallback ไปโฟลเดอร์ data ข้าง app.py
+DATA_DIR = (
+    VOLUME_MOUNT_PATH
+    if HAS_RAILWAY_VOLUME
+    else os.path.join(os.path.dirname(__file__), "data")
+)
+os.makedirs(DATA_DIR, exist_ok=True)
+
+SQLITE_PATH = os.path.join(DATA_DIR, "bot.db")
 
 # =========================
 # PEH / เปะ (เฉพาะฟีเจอร์นี้จากไฟล์อ้างอิง)
@@ -71,98 +84,103 @@ TARGET_GROUP_NAME = os.getenv(
 # =========================
 # UID directory / รายชื่อผู้ที่เคยทักบอท
 # =========================
-USERS_TXT_PATH = os.path.join(os.path.dirname(__file__), "oa_users.txt")
+USERS_TXT_PATH = os.path.join(DATA_DIR, "oa_users.txt")
 _USERS_LOCK = threading.Lock()
 
 # =========================
-# Optional PostgreSQL
+# Railway Volume + SQLite
 # =========================
+_DB_LOCK = threading.RLock()
+
+
 def get_db():
-    if not DATABASE_URL:
-        return None
+    """เปิด SQLite ที่อยู่บน Railway Volume"""
+    conn = sqlite3.connect(
+        SQLITE_PATH,
+        timeout=20,
+        check_same_thread=False,
+    )
+    conn.row_factory = sqlite3.Row
 
-    import psycopg2
-
-    db_url = DATABASE_URL
-    if db_url.startswith("postgres://"):
-        db_url = "postgresql://" + db_url[len("postgres://"):]
-
-    return psycopg2.connect(db_url)
+    # เหมาะกับ bot ที่มี concurrent requests เล็กน้อย
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA busy_timeout=10000;")
+    return conn
 
 
 def init_db():
-    if not DATABASE_URL:
-        print("[DB] DATABASE_URL not set. Persistent admins are disabled.")
-        return
-
+    """สร้างฐานข้อมูลถาวรบน Volume"""
     conn = None
     try:
         conn = get_db()
         cur = conn.cursor()
 
-        # สลิปที่ใช้แล้ว
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS used_slips (
-                id BIGSERIAL PRIMARY KEY,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 trans_ref TEXT UNIQUE NOT NULL,
-                amount NUMERIC(12,2),
+                amount REAL,
                 sender_name TEXT,
                 sender_bank TEXT,
                 receiver_name TEXT,
                 receiver_bank TEXT,
                 slip_date TEXT,
-                created_at TIMESTAMPTZ DEFAULT NOW()
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
             """
         )
 
-        # รายชื่อ LINE ที่บอทเคยพบ เก็บใน PostgreSQL เพื่อไม่หายหลัง reboot/redeploy
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS line_users (
                 uid TEXT PRIMARY KEY,
                 display_name TEXT NOT NULL DEFAULT '',
-                updated_at TIMESTAMPTZ DEFAULT NOW()
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
             """
         )
 
-        # แอดมินที่เพิ่มจากคำสั่ง "เพิ่มแอด @ชื่อไลน์"
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS bot_admins (
                 uid TEXT PRIMARY KEY,
                 display_name TEXT NOT NULL DEFAULT '',
                 added_by TEXT,
-                created_at TIMESTAMPTZ DEFAULT NOW()
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
             """
         )
 
-        # Seed แอดมินเดิมจาก ADMIN_UIDS / ค่า default เข้า DB
+        # Seed แอดมินเดิมเข้า SQLite
         for uid in ADMIN_UIDS:
             cur.execute(
                 """
-                INSERT INTO bot_admins (uid, display_name, added_by)
-                VALUES (%s, %s, %s)
-                ON CONFLICT (uid) DO NOTHING
+                INSERT OR IGNORE INTO bot_admins
+                    (uid, display_name, added_by)
+                VALUES (?, ?, ?)
                 """,
                 (uid, "", "bootstrap"),
             )
 
-        # โหลดแอดมินถาวรจาก DB เข้า memory
+        # โหลดแอดมินถาวรกลับเข้า memory
         cur.execute("SELECT uid FROM bot_admins")
         for row in cur.fetchall():
-            if row and row[0]:
-                ADMIN_UIDS.add(str(row[0]).strip())
+            saved_uid = str(row["uid"] or "").strip()
+            if saved_uid:
+                ADMIN_UIDS.add(saved_uid)
 
         conn.commit()
         cur.close()
 
-        print(f"[DB] tables ready. admins loaded: {len(ADMIN_UIDS)}")
+        storage_type = "Railway Volume" if HAS_RAILWAY_VOLUME else "local non-persistent storage"
+        print(
+            f"[DB] SQLite ready: {SQLITE_PATH} "
+            f"({storage_type}), admins={len(ADMIN_UIDS)}"
+        )
     except Exception as exc:
-        print("[DB] init error:", exc)
+        print("[DB] SQLite init error:", exc)
         if conn:
             conn.rollback()
     finally:
@@ -171,27 +189,28 @@ def init_db():
 
 
 def _upsert_line_user_db(uid: str, display_name: str):
-    """เก็บ UID + ชื่อใน PostgreSQL เพื่อให้ค้นหาได้แม้ bot reboot/redeploy"""
-    if not DATABASE_URL or not uid:
+    """เก็บ UID + ชื่อใน SQLite"""
+    if not uid:
         return
 
     conn = None
     try:
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute(
-            """
-            INSERT INTO line_users (uid, display_name, updated_at)
-            VALUES (%s, %s, NOW())
-            ON CONFLICT (uid)
-            DO UPDATE SET
-                display_name = EXCLUDED.display_name,
-                updated_at = NOW()
-            """,
-            (uid, display_name or ""),
-        )
-        conn.commit()
-        cur.close()
+        with _DB_LOCK:
+            conn = get_db()
+            cur = conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO line_users (uid, display_name, updated_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(uid)
+                DO UPDATE SET
+                    display_name = excluded.display_name,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (uid, display_name or ""),
+            )
+            conn.commit()
+            cur.close()
     except Exception as exc:
         print("[DB] line_users upsert error:", exc)
         if conn:
@@ -202,10 +221,7 @@ def _upsert_line_user_db(uid: str, display_name: str):
 
 
 def _search_users_db(name_query: str, limit: int = 10):
-    """ค้น UID จาก display name ใน PostgreSQL"""
-    if not DATABASE_URL:
-        return []
-
+    """ค้น UID จาก display name ใน SQLite"""
     query = (name_query or "").strip()
     if not query:
         return []
@@ -218,15 +234,18 @@ def _search_users_db(name_query: str, limit: int = 10):
             """
             SELECT uid, display_name
             FROM line_users
-            WHERE display_name ILIKE %s
+            WHERE display_name LIKE ?
             ORDER BY updated_at DESC
-            LIMIT %s
+            LIMIT ?
             """,
-            (f"%{query}%", limit),
+            (f"%{query}%", int(limit)),
         )
         rows = cur.fetchall()
         cur.close()
-        return [(str(uid), str(name or "")) for uid, name in rows]
+        return [
+            (str(row["uid"]), str(row["display_name"] or ""))
+            for row in rows
+        ]
     except Exception as exc:
         print("[DB] user search error:", exc)
         return []
@@ -237,9 +256,7 @@ def _search_users_db(name_query: str, limit: int = 10):
 
 def is_admin_uid(uid: str) -> bool:
     """
-    ตรวจสิทธิ์แอดมิน
-    - เช็ก memory ก่อน
-    - ถ้าไม่พบ จะเช็ก PostgreSQL เพื่อรองรับหลาย worker / หลัง reboot
+    ตรวจสิทธิ์แอดมินจาก memory และ SQLite
     """
     if not uid:
         return False
@@ -247,14 +264,14 @@ def is_admin_uid(uid: str) -> bool:
     if uid in ADMIN_UIDS:
         return True
 
-    if not DATABASE_URL:
-        return False
-
     conn = None
     try:
         conn = get_db()
         cur = conn.cursor()
-        cur.execute("SELECT 1 FROM bot_admins WHERE uid = %s LIMIT 1", (uid,))
+        cur.execute(
+            "SELECT 1 FROM bot_admins WHERE uid = ? LIMIT 1",
+            (uid,),
+        )
         found = cur.fetchone() is not None
         cur.close()
 
@@ -272,14 +289,15 @@ def is_admin_uid(uid: str) -> bool:
 
 def add_admin_persistent(uid: str, display_name: str, added_by: str):
     """
-    เพิ่มแอดมินถาวรลง PostgreSQL
+    เพิ่มแอดมินลง SQLite บน Railway Volume
     return: (ok, already_exists, message)
     """
-    if not DATABASE_URL:
+    if not HAS_RAILWAY_VOLUME:
         return (
             False,
             False,
-            "ยังไม่ได้ตั้ง DATABASE_URL จึงยังเก็บแอดมินแบบถาวรไม่ได้"
+            "ไม่พบ Railway Volume ใน runtime "
+            "(RAILWAY_VOLUME_MOUNT_PATH ไม่มีค่า)"
         )
 
     if not uid:
@@ -287,33 +305,33 @@ def add_admin_persistent(uid: str, display_name: str, added_by: str):
 
     conn = None
     try:
-        conn = get_db()
-        cur = conn.cursor()
+        with _DB_LOCK:
+            conn = get_db()
+            cur = conn.cursor()
 
-        cur.execute(
-            "SELECT 1 FROM bot_admins WHERE uid = %s LIMIT 1",
-            (uid,),
-        )
-        already = cur.fetchone() is not None
+            cur.execute(
+                "SELECT 1 FROM bot_admins WHERE uid = ? LIMIT 1",
+                (uid,),
+            )
+            already = cur.fetchone() is not None
 
-        cur.execute(
-            """
-            INSERT INTO bot_admins (uid, display_name, added_by)
-            VALUES (%s, %s, %s)
-            ON CONFLICT (uid)
-            DO UPDATE SET
-                display_name = EXCLUDED.display_name
-            """,
-            (uid, display_name or "", added_by or ""),
-        )
+            cur.execute(
+                """
+                INSERT INTO bot_admins (uid, display_name, added_by)
+                VALUES (?, ?, ?)
+                ON CONFLICT(uid)
+                DO UPDATE SET
+                    display_name = excluded.display_name
+                """,
+                (uid, display_name or "", added_by or ""),
+            )
 
-        conn.commit()
-        cur.close()
+            conn.commit()
+            cur.close()
 
-        # ใช้งานได้ทันทีใน worker ปัจจุบัน
         ADMIN_UIDS.add(uid)
-
         return True, already, "OK"
+
     except Exception as exc:
         if conn:
             conn.rollback()
@@ -324,26 +342,19 @@ def add_admin_persistent(uid: str, display_name: str, added_by: str):
             conn.close()
 
 
-
-
 def claim_trans_ref(data: dict) -> bool:
     """
-    Returns:
-      True  = transRef was newly inserted
-      False = transRef already exists
-    If no DATABASE_URL is configured, returns True and relies on EasySlip.
+    กันสลิปซ้ำอีกชั้นด้วย SQLite
+    True  = transRef ใหม่
+    False = transRef เคยใช้แล้ว
     """
-    if not DATABASE_URL:
-        return True
-
     raw = data.get("rawSlip") or {}
     trans_ref = str(raw.get("transRef") or "").strip()
 
     if not trans_ref:
-        # If EasySlip didn't provide a transRef, don't block a valid response.
         return True
 
-    amount = safe_float((((raw.get("amount") or {}).get("amount"))))
+    amount = safe_float(((raw.get("amount") or {}).get("amount")))
     sender = raw.get("sender") or {}
     receiver = raw.get("receiver") or {}
 
@@ -355,36 +366,41 @@ def claim_trans_ref(data: dict) -> bool:
 
     conn = None
     try:
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute(
-            """
-            INSERT INTO used_slips
-                (trans_ref, amount, sender_name, sender_bank,
-                 receiver_name, receiver_bank, slip_date)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (trans_ref) DO NOTHING
-            RETURNING id
-            """,
-            (
-                trans_ref,
-                amount,
-                sender_name,
-                sender_bank,
-                receiver_name,
-                receiver_bank,
-                slip_date,
-            ),
-        )
-        inserted = cur.fetchone()
-        conn.commit()
-        cur.close()
-        return inserted is not None
+        with _DB_LOCK:
+            conn = get_db()
+            cur = conn.cursor()
+
+            cur.execute(
+                """
+                INSERT OR IGNORE INTO used_slips
+                    (
+                        trans_ref, amount, sender_name, sender_bank,
+                        receiver_name, receiver_bank, slip_date
+                    )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    trans_ref,
+                    amount,
+                    sender_name,
+                    sender_bank,
+                    receiver_name,
+                    receiver_bank,
+                    slip_date,
+                ),
+            )
+
+            inserted = cur.rowcount == 1
+            conn.commit()
+            cur.close()
+            return inserted
+
     except Exception as exc:
-        # Do not make the bot unusable if DB is temporarily unavailable.
         print("[DB] claim_trans_ref error:", exc)
         if conn:
             conn.rollback()
+
+        # EasySlip V2 ยังมี checkDuplicate=true อยู่ จึงไม่ทำให้ bot ล่ม
         return True
     finally:
         if conn:
@@ -1585,20 +1601,20 @@ SLIP_SEND_URL = "https://page.line.me/812anmhp"
 
 def account_send_slip_flex() -> dict:
     """
-    FLEX ขนาดเล็กสำหรับส่งต่อหลังข้อความเลขบัญชี
-    กดแล้วเปิด LINE OA ตามลิงก์ที่กำหนด
+    FLEX ปุ่มส่งสลิปแบบกะทัดรัด แต่กว้างพอให้เห็นคำว่า
+    'ส่งสลิปที่นี่' ครบถ้วนบนมือถือ
     """
     return {
         "type": "flex",
         "altText": "📤 ส่งสลิปที่นี่",
         "contents": {
             "type": "bubble",
-            "size": "nano",
+            "size": "micro",
             "body": {
                 "type": "box",
                 "layout": "vertical",
                 "backgroundColor": "#FFFFFF",
-                "paddingAll": "10px",
+                "paddingAll": "12px",
                 "contents": [
                     {
                         "type": "button",
@@ -1607,7 +1623,7 @@ def account_send_slip_flex() -> dict:
                         "color": "#06C755",
                         "action": {
                             "type": "uri",
-                            "label": "📤 ส่งสลิปที่นี่",
+                            "label": "ส่งสลิปที่นี่",
                             "uri": SLIP_SEND_URL
                         }
                     }
@@ -1699,13 +1715,13 @@ def handle_text(event: dict):
             )
             return
 
-        if not DATABASE_URL:
+        if not HAS_RAILWAY_VOLUME:
             reply_line(
                 reply_token,
                 [text_message(
-                    "⚠️ ยังเพิ่มแอดมินแบบถาวรไม่ได้\n"
-                    "กรุณาเพิ่ม Railway PostgreSQL และตั้ง DATABASE_URL ก่อน\n"
-                    "เพื่อให้รายชื่อแอดมินไม่หายหลัง reboot/redeploy"
+                    "⚠️ ไม่พบ Railway Volume ใน runtime\n"
+                    "ให้ตรวจว่า Volume ผูกกับ service web และมี Mount Path แล้ว\n"
+                    "จากนั้น Redeploy อีกครั้ง"
                 )]
             )
             return
@@ -1801,7 +1817,7 @@ def handle_text(event: dict):
                 "✅ เพิ่มแอดมินถาวรเรียบร้อย\n"
                 f"👤 {target_name}\n"
                 f"🆔 {target_uid}\n\n"
-                "ข้อมูลถูกเก็บใน PostgreSQL แล้ว "
+                "ข้อมูลถูกเก็บใน Railway Volume (SQLite) แล้ว "
                 "รีบอทหรือ Redeploy รายชื่อก็ไม่หาย"
             )
 
@@ -1950,6 +1966,16 @@ def home():
             "easyslip": "v2",
         }
     )
+
+
+@app.get("/storage-status")
+def storage_status():
+    return jsonify({
+        "volume_detected": HAS_RAILWAY_VOLUME,
+        "mount_path": VOLUME_MOUNT_PATH or None,
+        "sqlite_path": SQLITE_PATH,
+        "sqlite_exists": os.path.exists(SQLITE_PATH),
+    }), 200
 
 
 @app.get("/health")
