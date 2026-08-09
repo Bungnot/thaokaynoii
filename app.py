@@ -1,5 +1,5 @@
 import os
-import re
+import json
 import requests
 from flask import Flask, request, abort
 from linebot.v3 import WebhookHandler
@@ -17,13 +17,31 @@ from linebot.v3.webhooks import MessageEvent, ImageMessageContent, TextMessageCo
 
 app = Flask(__name__)
 
-# LINE credentials from environment
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET")
 EASY_SLIP_API_KEY = os.environ.get("EASY_SLIP_API_KEY")
 
 configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
+
+# ไฟล์เก็บสลิปที่ใช้แล้ว
+USED_SLIPS_FILE = "/tmp/used_slips.json"
+
+def load_used_slips() -> set:
+    try:
+        with open(USED_SLIPS_FILE, "r") as f:
+            return set(json.load(f))
+    except Exception:
+        return set()
+
+def save_used_slip(trans_ref: str):
+    slips = load_used_slips()
+    slips.add(trans_ref)
+    with open(USED_SLIPS_FILE, "w") as f:
+        json.dump(list(slips), f)
+
+def is_slip_used(trans_ref: str) -> bool:
+    return trans_ref in load_used_slips()
 
 ACCOUNT_MESSAGE = (
     "━━━━━━━━━━━━━━\n"
@@ -40,7 +58,6 @@ ACCOUNT_KEYWORDS = ["บช", "บัญชี", "account", "โอนเงิ�
 
 
 def verify_slip_with_easyslip(image_content: bytes) -> dict:
-    """ส่งรูปสลิปไปยัง EasySlip API และคืนผลลัพธ์"""
     url = "https://developer.easyslip.com/api/v1/verify"
     headers = {"Authorization": f"Bearer {EASY_SLIP_API_KEY}"}
     files = {"file": ("slip.jpg", image_content, "image/jpeg")}
@@ -52,7 +69,6 @@ def verify_slip_with_easyslip(image_content: bytes) -> dict:
 
 
 def build_success_flex(data: dict) -> dict:
-    """สร้าง Flex Message เมื่อตรวจสอบสลิปสำเร็จ"""
     payment = data.get("data", {})
     amount = payment.get("amount", {}).get("amount", "-")
     sender_name = payment.get("sender", {}).get("displayName", "-")
@@ -61,7 +77,7 @@ def build_success_flex(data: dict) -> dict:
     trans_ref = payment.get("transRef", "-")
     bank_name = payment.get("receiver", {}).get("bank", {}).get("name", "-")
 
-    flex_body = {
+    return {
         "type": "bubble",
         "size": "kilo",
         "header": {
@@ -108,7 +124,6 @@ def build_success_flex(data: dict) -> dict:
             ],
         },
     }
-    return flex_body
 
 
 def _flex_row(label: str, value: str) -> dict:
@@ -136,7 +151,6 @@ def callback():
 
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_text(event):
-    """จัดการข้อความตัวอักษร — ถ้าเกี่ยวกับบัญชีให้ส่งข้อมูลบัญชี"""
     text = event.message.text.strip().lower()
     with ApiClient(configuration) as api_client:
         line_bot_api = MessagingApi(api_client)
@@ -162,19 +176,40 @@ def handle_text(event):
 
 @handler.add(MessageEvent, message=ImageMessageContent)
 def handle_image(event):
-    """รับรูปภาพ → ตรวจสอบกับ EasySlip → ตอบกลับผลลัพธ์"""
     with ApiClient(configuration) as api_client:
         line_bot_api = MessagingApi(api_client)
 
-        # ดึงรูปภาพจาก LINE
         message_content = line_bot_api.get_message_content(event.message.id)
         image_data = b"".join(message_content)
 
-        # ส่งไปตรวจสอบกับ EasySlip
         result = verify_slip_with_easyslip(image_data)
         status = result.get("status", 500)
 
         if status == 200:
+            trans_ref = result.get("data", {}).get("transRef", "")
+
+            # ตรวจสอบสลิปซ้ำ
+            if trans_ref and is_slip_used(trans_ref):
+                line_bot_api.reply_message(
+                    ReplyMessageRequest(
+                        reply_token=event.reply_token,
+                        messages=[
+                            TextMessage(
+                                text=(
+                                    "⚠️ สลิปนี้เคยถูกใช้งานแล้ว\n\n"
+                                    f"🔖 เลขอ้างอิง: {trans_ref}\n\n"
+                                    "กรุณาส่งสลิปใหม่ที่ยังไม่เคยใช้ หรือติดต่อเจ้าหน้าที่"
+                                )
+                            )
+                        ],
+                    )
+                )
+                return
+
+            # บันทึกสลิปที่ใช้แล้ว
+            if trans_ref:
+                save_used_slip(trans_ref)
+
             flex_body = build_success_flex(result)
             line_bot_api.reply_message(
                 ReplyMessageRequest(
