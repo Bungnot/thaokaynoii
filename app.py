@@ -6,8 +6,6 @@ import re
 import csv
 import threading
 import sqlite3
-import cv2
-import numpy as np
 from datetime import datetime
 
 import requests
@@ -478,9 +476,12 @@ def claim_trans_ref(data: dict) -> bool:
 def extract_qr_payload_local(image_bytes: bytes) -> str:
     """
     อ่าน QR จากรูปด้วย OpenCV ภายใน Railway
-    ไม่เรียก EasySlip จึงไม่เสีย quota
+    import ตอนใช้งานจริงเท่านั้น เพื่อไม่ให้ startup/healthcheck ช้า
     """
     try:
+        import cv2
+        import numpy as np
+
         arr = np.frombuffer(image_bytes, dtype=np.uint8)
         image = cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
@@ -2258,6 +2259,19 @@ def health():
     return "OK", 200
 
 
+@app.get("/ready")
+def ready():
+    try:
+        conn = get_db()
+        conn.execute("SELECT 1")
+        conn.close()
+        return jsonify({"ok": True, "sqlite": True}), 200
+    except Exception as exc:
+        return jsonify({"ok": False, "sqlite": False, "error": str(exc)}), 503
+
+
+
+
 @app.post("/webhook")
 def webhook():
     raw_body = request.get_data()
@@ -2288,7 +2302,21 @@ def webhook():
     return "OK", 200
 
 
-init_db()
+def _init_db_background():
+    """เริ่ม SQLite หลัง Gunicorn import app แล้ว เพื่อให้ /health พร้อมตอบเร็ว"""
+    try:
+        init_db()
+    except Exception as exc:
+        print("[DB] background init error:", exc)
+
+
+# ห้ามบล็อก Gunicorn startup ด้วย Volume/SQLite
+threading.Thread(
+    target=_init_db_background,
+    name="sqlite-init",
+    daemon=True
+).start()
+
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8080"))
