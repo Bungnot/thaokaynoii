@@ -113,6 +113,12 @@ def flex_duplicate(trans_ref: str) -> dict:
         ("สถานะ",         "เคยใช้สลิปนี้ไปแล้ว"),
     ], "กรุณาส่งสลิปใหม่ หรือติดต่อเจ้าหน้าที่")
 
+def flex_pending() -> dict:
+    return make_flex("⏳ สลิปอยู่ระหว่างประมวลผล", "#8E44AD", [
+        ("สถานะ",    "ธนาคารยังประมวลผลไม่เสร็จ"),
+        ("คำแนะนำ", "รอ 1-2 นาที แล้วส่งสลิปใหม่อีกครั้ง"),
+    ], "พบบ่อยในสลิปธนาคารกรุงเทพ / กรุงไทย")
+
 def flex_error(reason: str) -> dict:
     return make_flex("❌ ตรวจสอบไม่สำเร็จ", "#95A5A6", [
         ("สาเหตุ",    reason),
@@ -189,8 +195,11 @@ def handle_image(event):
         reply_flex(event.reply_token, "✅ ตรวจสอบสลิปสำเร็จ", flex_success(result))
 
     else:
-        err = result.get("message", "ไม่สามารถตรวจสอบสลิปได้")
-        reply_flex(event.reply_token, "❌ ตรวจสอบไม่สำเร็จ", flex_error(err))
+        err = result.get("message", "")
+        if "pending" in err.lower():
+            reply_flex(event.reply_token, "⏳ สลิปอยู่ระหว่างประมวลผล", flex_pending())
+        else:
+            reply_flex(event.reply_token, "❌ ตรวจสอบไม่สำเร็จ", flex_error(err or "ไม่สามารถตรวจสอบสลิปได้"))
 
 @app.route("/", methods=["GET"])
 def health():
