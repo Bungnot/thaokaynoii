@@ -44,7 +44,7 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 # PEH / เปะ (เฉพาะฟีเจอร์นี้จากไฟล์อ้างอิง)
 # =========================
 _DEFAULT_ADMIN_UIDS = {
-    "U92e11a31ee95453438aea73123c68fc0",
+    "U255dd67c1fef32fb0eae127149c7cadc",
     "Uf7e207bfdd69d8e41806436fa7a86c14",
     "U163186c5013c8f1e4820291b7b1d86bd",
     "Uc2013ea8397da6d19cbe0f931a04c949",
@@ -816,25 +816,335 @@ def _source_key(event: dict) -> str:
     )
 
 
-def _add_peh_item(event: dict, text: str) -> str:
+def _add_peh_item(event: dict, text: str):
+    """เพิ่มรายการ PEH ลงในห้อง/กลุ่ม/แชทนั้น ๆ"""
     key = _source_key(event)
 
     if key not in PEH_LIST:
         PEH_LIST[key] = []
 
     PEH_LIST[key].append(text)
+    return PEH_LIST[key]
 
-    header = (
-        f"{TARGET_GROUP_NAME}\n"
-        f"สกอบั้งไฟวันนี้\n"
-        f"{'-' * 25}"
-    )
 
-    lines = []
-    for i, item in enumerate(PEH_LIST[key], start=1):
-        lines.append(f"{i}. {item}")
+# ====== สถานะของรายการ "เปะ" ======
+PEH_STATUS = {
+    "✅": {
+        "key": "win",
+        "label": "ชนะ",
+        "row_bg": "#F0FDF4",
+        "badge": "#16A34A",
+        "chip_bg": "#DCFCE7",
+        "chip_text": "#166534",
+    },
+    "❌": {
+        "key": "lose",
+        "label": "แพ้",
+        "row_bg": "#FEF2F2",
+        "badge": "#DC2626",
+        "chip_bg": "#FEE2E2",
+        "chip_text": "#991B1B",
+    },
+    "⛔": {
+        "key": "draw",
+        "label": "จาว",
+        "row_bg": "#FFFBEB",
+        "badge": "#D97706",
+        "chip_bg": "#FEF3C7",
+        "chip_text": "#92400E",
+    },
+}
 
-    return header + "\n" + "\n".join(lines)
+
+def _peh_parse_status(item: str):
+    """
+    อ่านสถานะจาก emoji:
+      ✅ = ชนะ
+      ❌ = แพ้
+      ⛔ = จาว
+
+    - 1 รายการนับเป็น 1 ผลเท่านั้น ไม่ได้นับตามจำนวน emoji
+    - ใน FLEX แสดง emoji ของผลนั้นสูงสุด 2 ตัว
+    - ถ้าเผลอใส่ emoji หลายชนิดในบรรทัดเดียว จะยึดชนิดที่ปรากฏก่อนสุด
+    """
+    raw = str(item or "").strip()
+
+    found = []
+    for symbol in PEH_STATUS:
+        pos = raw.find(symbol)
+        if pos >= 0:
+            found.append((pos, symbol))
+
+    if not found:
+        return None, raw
+
+    _, symbol = min(found, key=lambda x: x[0])
+
+    # ลบ emoji สถานะทั้งหมดออกจากข้อความ แล้วใส่กลับเฉพาะสถานะที่เลือก
+    clean_text = re.sub(r"[✅❌⛔]+", "", raw)
+    clean_text = re.sub(r"\s+", " ", clean_text).strip()
+
+    # ไม่ว่าจะพิมพ์ 3, 4, 10 ตัว ใน FLEX จะแสดงสูงสุด 2 ตัว
+    symbol_count = min(2, max(1, raw.count(symbol)))
+    display_text = f"{clean_text} {symbol * symbol_count}".strip()
+
+    return symbol, display_text
+
+
+def _peh_stat_chip(title: str, value: int, emoji: str, bg: str, fg: str) -> dict:
+    return {
+        "type": "box",
+        "layout": "vertical",
+        "flex": 1,
+        "cornerRadius": "12px",
+        "backgroundColor": bg,
+        "paddingAll": "10px",
+        "contents": [
+            {
+                "type": "text",
+                "text": f"{emoji} {title}",
+                "size": "xs",
+                "weight": "bold",
+                "color": fg,
+                "align": "center",
+            },
+            {
+                "type": "text",
+                "text": str(value),
+                "size": "xl",
+                "weight": "bold",
+                "color": fg,
+                "align": "center",
+                "margin": "xs",
+            },
+        ],
+    }
+
+
+def peh_flex_message(event: dict) -> dict:
+    """สร้าง FLEX รายการเปะ พร้อมนับ ชนะ / แพ้ / จาว อัตโนมัติ"""
+    key = _source_key(event)
+    items = PEH_LIST.get(key, [])
+    total = len(items)
+
+    stats = {
+        "win": 0,
+        "lose": 0,
+        "draw": 0,
+    }
+
+    parsed_items = []
+
+    # นับผล "ต่อรายการ" ไม่ใช่ต่อจำนวน emoji
+    for item in items:
+        symbol, display_text = _peh_parse_status(item)
+
+        if symbol:
+            status_info = PEH_STATUS[symbol]
+            stats[status_info["key"]] += 1
+        else:
+            status_info = None
+
+        parsed_items.append((display_text, symbol, status_info))
+
+    item_boxes = []
+
+    for i, (display_text, symbol, status_info) in enumerate(parsed_items, start=1):
+        if status_info:
+            row_bg = status_info["row_bg"]
+            badge_color = status_info["badge"]
+        else:
+            row_bg = "#FFFFFF"
+            badge_color = "#06C755"
+
+        item_boxes.append(
+            {
+                "type": "box",
+                "layout": "horizontal",
+                "spacing": "md",
+                "paddingAll": "12px",
+                "cornerRadius": "12px",
+                "backgroundColor": row_bg,
+                "contents": [
+                    {
+                        "type": "box",
+                        "layout": "vertical",
+                        "width": "34px",
+                        "height": "34px",
+                        "cornerRadius": "17px",
+                        "backgroundColor": badge_color,
+                        "justifyContent": "center",
+                        "alignItems": "center",
+                        "flex": 0,
+                        "contents": [
+                            {
+                                "type": "text",
+                                "text": str(i),
+                                "size": "sm",
+                                "weight": "bold",
+                                "color": "#FFFFFF",
+                                "align": "center",
+                            }
+                        ],
+                    },
+                    {
+                        "type": "text",
+                        "text": display_text,
+                        "size": "md",
+                        "weight": "bold",
+                        "color": "#16394F",
+                        "wrap": True,
+                        "gravity": "center",
+                        "flex": 1,
+                    },
+                ],
+            }
+        )
+
+    if not item_boxes:
+        item_boxes.append(
+            {
+                "type": "text",
+                "text": "ยังไม่มีรายการ",
+                "align": "center",
+                "size": "sm",
+                "color": "#7B8B94",
+                "margin": "lg",
+            }
+        )
+
+    # แถวหัวตาราง: ชนะ / แพ้ / จาว
+    summary_row = {
+        "type": "box",
+        "layout": "horizontal",
+        "spacing": "sm",
+        "contents": [
+            _peh_stat_chip(
+                "ชนะ",
+                stats["win"],
+                "✅",
+                PEH_STATUS["✅"]["chip_bg"],
+                PEH_STATUS["✅"]["chip_text"],
+            ),
+            _peh_stat_chip(
+                "แพ้",
+                stats["lose"],
+                "❌",
+                PEH_STATUS["❌"]["chip_bg"],
+                PEH_STATUS["❌"]["chip_text"],
+            ),
+            _peh_stat_chip(
+                "จาว",
+                stats["draw"],
+                "⛔",
+                PEH_STATUS["⛔"]["chip_bg"],
+                PEH_STATUS["⛔"]["chip_text"],
+            ),
+        ],
+    }
+
+    bubble = {
+        "type": "bubble",
+        "size": "mega",
+        "header": {
+            "type": "box",
+            "layout": "vertical",
+            "backgroundColor": "#06C755",
+            "paddingAll": "20px",
+            "contents": [
+                {
+                    "type": "text",
+                    "text": "🚀 เถ้าแก่น้อย",
+                    "size": "sm",
+                    "weight": "bold",
+                    "color": "#DFFFF0",
+                    "align": "center",
+                },
+                {
+                    "type": "text",
+                    "text": "สกอบั้งไฟวันนี้",
+                    "size": "xl",
+                    "weight": "bold",
+                    "color": "#FFFFFF",
+                    "align": "center",
+                    "margin": "sm",
+                },
+                {
+                    "type": "box",
+                    "layout": "horizontal",
+                    "justifyContent": "center",
+                    "margin": "md",
+                    "contents": [
+                        {
+                            "type": "box",
+                            "layout": "vertical",
+                            "cornerRadius": "20px",
+                            "backgroundColor": "#FFFFFF33",
+                            "paddingStart": "12px",
+                            "paddingEnd": "12px",
+                            "paddingTop": "6px",
+                            "paddingBottom": "6px",
+                            "contents": [
+                                {
+                                    "type": "text",
+                                    "text": f"ทั้งหมด {total} รายการ",
+                                    "size": "xs",
+                                    "weight": "bold",
+                                    "color": "#FFFFFF",
+                                    "align": "center",
+                                }
+                            ],
+                        }
+                    ],
+                },
+            ],
+        },
+        "body": {
+            "type": "box",
+            "layout": "vertical",
+            "backgroundColor": "#F3FAF4",
+            "paddingAll": "16px",
+            "spacing": "sm",
+            "contents": [
+                summary_row,
+                {
+                    "type": "separator",
+                    "margin": "md",
+                    "color": "#CFE7D3",
+                },
+            ]
+            + item_boxes
+            + [
+                {
+                    "type": "separator",
+                    "margin": "lg",
+                    "color": "#CFE7D3",
+                },
+                {
+                    "type": "text",
+                    "text": TARGET_GROUP_NAME,
+                    "size": "xs",
+                    "color": "#71827A",
+                    "align": "center",
+                    "wrap": True,
+                    "margin": "md",
+                },
+            ],
+        },
+        "styles": {
+            "header": {"separator": False},
+            "body": {"separator": False},
+        },
+    }
+
+    return {
+        "type": "flex",
+        "altText": (
+            f"สกอบั้งไฟวันนี้ • "
+            f"ชนะ {stats['win']} แพ้ {stats['lose']} จาว {stats['draw']}"
+        ),
+        "contents": bubble,
+    }
 
 
 # =========================
@@ -918,17 +1228,16 @@ def handle_text(event: dict):
     if is_admin and "เปะ" in text:
         lines = text.split("\n")
         added = False
-        final_output = None
 
         for line in lines:
             m = re.match(r"^เปะ\s+(.+)$", line.strip())
             if m:
                 item_text = m.group(1).strip()
-                final_output = _add_peh_item(event, item_text)
+                _add_peh_item(event, item_text)
                 added = True
 
         if added:
-            reply_line(reply_token, [text_message(final_output)])
+            reply_line(reply_token, [peh_flex_message(event)])
             return
 
     # ====== ล้างรายการ PEH (เฉพาะแอดมิน) ======
