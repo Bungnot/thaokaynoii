@@ -21,7 +21,7 @@ app = Flask(__name__)
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET")
 EASY_SLIP_API_KEY = os.environ.get("EASY_SLIP_API_KEY")
-OUR_ACCOUNT = "0748441328"
+OUR_ACCOUNT = os.environ.get("OUR_ACCOUNT", "0748441328")
 
 configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
