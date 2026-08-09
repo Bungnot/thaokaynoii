@@ -6,6 +6,8 @@ import re
 import csv
 import threading
 import sqlite3
+import cv2
+import numpy as np
 from datetime import datetime
 
 import requests
@@ -127,6 +129,20 @@ def init_db():
                 receiver_name TEXT,
                 receiver_bank TEXT,
                 slip_date TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+
+        # QR payload ที่เคยผ่าน EasySlip แล้ว
+        # ใช้กันการยิง EasySlip ซ้ำในอนาคต (ประหยัด quota)
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS verified_qr_payloads (
+                payload_hash TEXT PRIMARY KEY,
+                payload TEXT NOT NULL,
+                trans_ref TEXT,
+                result_type TEXT NOT NULL DEFAULT 'verified',
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
             """
@@ -407,6 +423,140 @@ def claim_trans_ref(data: dict) -> bool:
             conn.close()
 
 
+
+# =========================
+# Quota Saver: อ่าน QR ในเครื่องก่อนยิง EasySlip
+# =========================
+def extract_qr_payload_local(image_bytes: bytes) -> str:
+    """
+    อ่าน QR จากรูปด้วย OpenCV ภายใน Railway
+    ไม่เรียก EasySlip จึงไม่เสีย quota
+    """
+    try:
+        arr = np.frombuffer(image_bytes, dtype=np.uint8)
+        image = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+
+        if image is None:
+            return ""
+
+        detector = cv2.QRCodeDetector()
+
+        # ลองอ่าน QR เดี่ยวก่อน
+        data, points, _ = detector.detectAndDecode(image)
+        if data:
+            return str(data).strip()
+
+        # ลองหลาย QR ถ้ารูปมีมากกว่า 1 จุด
+        try:
+            ok, decoded_info, points, _ = detector.detectAndDecodeMulti(image)
+            if ok and decoded_info:
+                for value in decoded_info:
+                    value = str(value or "").strip()
+                    if value:
+                        return value
+        except Exception:
+            pass
+
+        # ลองขยายภาพเพื่อช่วยกรณี QR เล็ก
+        try:
+            enlarged = cv2.resize(
+                image,
+                None,
+                fx=1.8,
+                fy=1.8,
+                interpolation=cv2.INTER_CUBIC
+            )
+            data, points, _ = detector.detectAndDecode(enlarged)
+            if data:
+                return str(data).strip()
+        except Exception:
+            pass
+
+        return ""
+
+    except Exception as exc:
+        print("[QR] local decode error:", exc)
+        return ""
+
+
+def _payload_hash(payload: str) -> str:
+    return hashlib.sha256(
+        str(payload or "").encode("utf-8")
+    ).hexdigest()
+
+
+def local_qr_already_verified(payload: str) -> bool:
+    """
+    เช็ก QR payload กับ SQLite บน Volume ก่อนเรียก EasySlip
+    ถ้าเคยตรวจผ่านแล้ว จะไม่ยิง API ซ้ำ
+    """
+    if not payload:
+        return False
+
+    conn = None
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT 1
+            FROM verified_qr_payloads
+            WHERE payload_hash = ?
+            LIMIT 1
+            """,
+            (_payload_hash(payload),),
+        )
+        found = cur.fetchone() is not None
+        cur.close()
+        return found
+    except Exception as exc:
+        print("[QR] local cache lookup error:", exc)
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+
+def remember_verified_qr(payload: str, data: dict, result_type: str = "verified"):
+    """
+    จำ QR ที่ EasySlip เคยตอบ success แล้วลง Volume
+    เพื่อครั้งต่อไปไม่ต้องเสีย request อีก
+    """
+    if not payload:
+        return
+
+    raw = data.get("rawSlip") or {}
+    trans_ref = str(raw.get("transRef") or "").strip()
+
+    conn = None
+    try:
+        with _DB_LOCK:
+            conn = get_db()
+            cur = conn.cursor()
+            cur.execute(
+                """
+                INSERT OR REPLACE INTO verified_qr_payloads
+                    (payload_hash, payload, trans_ref, result_type, created_at)
+                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """,
+                (
+                    _payload_hash(payload),
+                    payload,
+                    trans_ref,
+                    result_type,
+                ),
+            )
+            conn.commit()
+            cur.close()
+    except Exception as exc:
+        print("[QR] remember cache error:", exc)
+        if conn:
+            conn.rollback()
+    finally:
+        if conn:
+            conn.close()
+
+
 # =========================
 # Helpers
 # =========================
@@ -496,34 +646,27 @@ def download_line_image(message_id: str) -> bytes:
     return resp.content
 
 
-def verify_with_easyslip(image_bytes: bytes) -> dict:
+def verify_payload_with_easyslip(qr_payload: str) -> dict:
     """
-    EasySlip API V2:
-      POST https://api.easyslip.com/v2/verify/bank
-      multipart/form-data:
-        image
-        matchAccount=true
-        checkDuplicate=true
+    EasySlip API V2 แบบ QR payload
+    เรียก API เฉพาะหลังจากอ่าน QR ในเครื่องได้แล้ว
     """
     headers = {
         "Authorization": f"Bearer {EASYSLIP_API_KEY}",
+        "Content-Type": "application/json",
     }
 
-    files = {
-        "image": ("slip.jpg", image_bytes, "image/jpeg"),
-    }
-
-    form = {
-        "checkDuplicate": "true",
-        "matchAccount": "true" if VERIFY_MATCH_ACCOUNT else "false",
+    body = {
+        "payload": qr_payload,
+        "checkDuplicate": True,
+        "matchAccount": VERIFY_MATCH_ACCOUNT,
         "remark": "LINE BOT เถ้าแก่น้อย",
     }
 
     resp = requests.post(
         EASYSLIP_VERIFY_URL,
         headers=headers,
-        files=files,
-        data=form,
+        json=body,
         timeout=30,
     )
 
@@ -540,6 +683,7 @@ def verify_with_easyslip(image_bytes: bytes) -> dict:
 
     payload["_http_status"] = resp.status_code
     return payload
+
 
 
 def normalize_easyslip_error(payload: dict):
@@ -753,6 +897,10 @@ ERROR_TEXTS = {
     "qrcode_not_found": (
         "ไม่พบ QR Code",
         "กรุณาส่งรูปสลิปเต็มใบและให้ QR Code มองเห็นชัดเจน",
+    ),
+    "local_qr_not_found": (
+        "อ่าน QR ไม่สำเร็จ",
+        "ระบบยังไม่ได้ส่งรูปไป EasySlip จึงไม่เสียโควต้า กรุณาส่งสลิปใหม่ให้ QR ชัดขึ้น",
     ),
     "invalid_image": (
         "รูปภาพไม่ถูกต้อง",
@@ -1882,6 +2030,15 @@ def handle_text(event: dict):
 
 
 def handle_image(event: dict):
+    # ====== ตรวจสลิปเฉพาะแชท 1-1 เท่านั้น ======
+    # group / room = เงียบ และไม่เสีย EasySlip quota
+    source = event.get("source") or {}
+    source_type = str(source.get("type") or "").lower()
+
+    if source_type != "user":
+        print(f"[SLIP] ignore image from source_type={source_type}")
+        return
+
     reply_token = event.get("replyToken")
     message = event.get("message") or {}
     message_id = str(message.get("id") or "")
@@ -1893,6 +2050,7 @@ def handle_image(event: dict):
         )
         return
 
+    # 1) ดาวน์โหลดจาก LINE ก่อน — ขั้นตอนนี้ไม่ใช้ EasySlip quota
     try:
         image_bytes = download_line_image(message_id)
     except Exception as exc:
@@ -1907,31 +2065,58 @@ def handle_image(event: dict):
         reply_line(reply_token, [error_flex("image_size_too_large")])
         return
 
+    # 2) อ่าน QR ภายใน Railway ก่อน
+    #    ถ้าไม่เจอ QR จะไม่เรียก EasySlip เลย
+    qr_payload = extract_qr_payload_local(image_bytes)
+
+    if not qr_payload:
+        # ไม่พบ QR = ถือว่าไม่ใช่สลิป
+        # เงียบ ไม่ตอบลูกค้า และไม่เรียก EasySlip จึงไม่เสีย quota
+        print("[SLIP] ignore image without QR code")
+        return
+
+    # 3) เช็ก QR เดิมจาก SQLite บน Volume ก่อน
+    #    ถ้าเคยตรวจแล้ว ไม่เรียก EasySlip ซ้ำ
+    if local_qr_already_verified(qr_payload):
+        reply_line(
+            reply_token,
+            [error_flex("duplicate_slip")]
+        )
+        return
+
+    # 4) ถึงตรงนี้เท่านั้นจึงยิง EasySlip V2
     try:
-        result = verify_with_easyslip(image_bytes)
+        result = verify_payload_with_easyslip(qr_payload)
     except requests.RequestException as exc:
         print("[EasySlip] request error:", exc)
         reply_line(
             reply_token,
-            [error_flex("easyslip_unavailable", "เชื่อมต่อ EasySlip ไม่สำเร็จ กรุณาลองใหม่")],
+            [
+                error_flex(
+                    "easyslip_unavailable",
+                    "เชื่อมต่อ EasySlip ไม่สำเร็จ กรุณาลองใหม่"
+                )
+            ],
         )
         return
 
-    # EasySlip V2 success
+    # 5) EasySlip V2 success
     if result.get("success") is True:
         data = result.get("data") or {}
 
-        # EasySlip can expose isDuplicate in success data.
+        # จำ QR ทันทีเมื่อ EasySlip ตอบ success
+        # เพื่อครั้งถัดไปไม่ต้องยิง API ซ้ำ
+        remember_verified_qr(qr_payload, data, "success")
+
         if data.get("isDuplicate") is True:
             reply_line(reply_token, [error_flex("duplicate_slip")])
             return
 
-        # When matchAccount=true, require a matched account.
         if VERIFY_MATCH_ACCOUNT and data.get("matchedAccount") is None:
             reply_line(reply_token, [error_flex("account_not_match")])
             return
 
-        # Optional second duplicate-protection layer using PostgreSQL.
+        # กัน transRef ซ้ำอีกชั้นด้วย SQLite
         if not claim_trans_ref(data):
             reply_line(reply_token, [error_flex("duplicate_slip")])
             return
@@ -1939,9 +2124,9 @@ def handle_image(event: dict):
         reply_line(reply_token, [success_flex(data)])
         return
 
+    # Error จาก EasySlip
     code, detail = normalize_easyslip_error(result)
 
-    # Support uppercase error codes from some V2 responses.
     alias = {
         "slip_not_found": "slip_not_found",
         "qrcode_not_found": "qrcode_not_found",
