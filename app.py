@@ -180,9 +180,15 @@ def handle_image(event):
         payment = result.get("data", {})
         trans_ref = payment.get("transRef", "")
         receiver_account = payment.get("receiver", {}).get("account", {}).get("value", "")
-        receiver_clean = receiver_account.replace("-", "").replace(" ", "")
 
-        if OUR_ACCOUNT not in receiver_clean:
+        # เช็คเลขบัญชีโดยเปรียบเทียบเฉพาะส่วนที่ไม่ใช่ x
+        # เช่น 074-8-xxx328 → เช็คว่า 0748 และ 328 อยู่ใน OUR_ACCOUNT ไหม
+        import re
+        digits_in_slip = re.sub(r'[^0-9]', '', receiver_account)  # เอาแค่ตัวเลขจริง (ไม่รวม x)
+        known_parts = [p for p in re.split(r'x+', receiver_account.replace('-','')) if p]
+        account_match = all(p in OUR_ACCOUNT for p in known_parts) if known_parts else False
+
+        if not account_match:
             reply_flex(event.reply_token, "❌ บัญชีผู้รับไม่ถูกต้อง", flex_wrong_account(receiver_account))
             return
 
@@ -208,3 +214,4 @@ def health():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
