@@ -1,5 +1,6 @@
 import os
 import json
+import threading
 import requests
 from flask import Flask, request, abort
 from linebot.v3 import WebhookHandler
@@ -9,6 +10,7 @@ from linebot.v3.messaging import (
     ApiClient,
     MessagingApi,
     ReplyMessageRequest,
+    PushMessageRequest,
     TextMessage,
     FlexMessage,
     FlexContainer,
@@ -24,7 +26,6 @@ EASY_SLIP_API_KEY = os.environ.get("EASY_SLIP_API_KEY")
 configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-# ไฟล์เก็บสลิปที่ใช้แล้ว
 USED_SLIPS_FILE = "/tmp/used_slips.json"
 
 def load_used_slips() -> set:
@@ -83,16 +84,8 @@ def build_success_flex(data: dict) -> dict:
         "header": {
             "type": "box",
             "layout": "vertical",
-            "contents": [
-                {
-                    "type": "text",
-                    "text": "✅ ตรวจสอบสลิปสำเร็จ",
-                    "color": "#ffffff",
-                    "size": "md",
-                    "weight": "bold",
-                    "align": "center",
-                }
-            ],
+            "contents": [{"type": "text", "text": "✅ ตรวจสอบสลิปสำเร็จ",
+                          "color": "#ffffff", "size": "md", "weight": "bold", "align": "center"}],
             "backgroundColor": "#27AE60",
             "paddingAll": "15px",
         },
@@ -113,15 +106,8 @@ def build_success_flex(data: dict) -> dict:
         "footer": {
             "type": "box",
             "layout": "vertical",
-            "contents": [
-                {
-                    "type": "text",
-                    "text": "ขอบคุณที่ใช้บริการ 🙏",
-                    "color": "#888888",
-                    "size": "xs",
-                    "align": "center",
-                }
-            ],
+            "contents": [{"type": "text", "text": "ขอบคุณที่ใช้บริการ 🙏",
+                          "color": "#888888", "size": "xs", "align": "center"}],
         },
     }
 
@@ -136,6 +122,60 @@ def _flex_row(label: str, value: str) -> dict:
         ],
         "margin": "sm",
     }
+
+
+def process_slip_async(user_id: str, image_data: bytes):
+    """ประมวลผลสลิปใน background thread แล้ว push ผลกลับ"""
+    with ApiClient(configuration) as api_client:
+        line_bot_api = MessagingApi(api_client)
+
+        result = verify_slip_with_easyslip(image_data)
+        status = result.get("status", 500)
+
+        if status == 200:
+            trans_ref = result.get("data", {}).get("transRef", "")
+
+            if trans_ref and is_slip_used(trans_ref):
+                line_bot_api.push_message(
+                    PushMessageRequest(
+                        to=user_id,
+                        messages=[TextMessage(text=(
+                            "⚠️ สลิปนี้เคยถูกใช้งานแล้ว\n\n"
+                            f"🔖 เลขอ้างอิง: {trans_ref}\n\n"
+                            "กรุณาส่งสลิปใหม่ที่ยังไม่เคยใช้ หรือติดต่อเจ้าหน้าที่"
+                        ))],
+                    )
+                )
+                return
+
+            if trans_ref:
+                save_used_slip(trans_ref)
+
+            flex_body = build_success_flex(result)
+            line_bot_api.push_message(
+                PushMessageRequest(
+                    to=user_id,
+                    messages=[FlexMessage(
+                        alt_text="✅ ตรวจสอบสลิปสำเร็จ",
+                        contents=FlexContainer.from_dict(flex_body),
+                    )],
+                )
+            )
+        else:
+            err_msg = result.get("message", "ไม่สามารถตรวจสอบสลิปได้")
+            line_bot_api.push_message(
+                PushMessageRequest(
+                    to=user_id,
+                    messages=[TextMessage(text=(
+                        f"❌ ตรวจสอบสลิปไม่สำเร็จ\n"
+                        f"สาเหตุ: {err_msg}\n\n"
+                        "กรุณาตรวจสอบ:\n"
+                        "• สลิปต้องเป็นสลิปจริง ไม่ใช่ภาพถ่ายหน้าจอซ้ำ\n"
+                        "• รูปภาพต้องชัดเจน ครบถ้วน\n"
+                        "• หากมีปัญหา กรุณาติดต่อเจ้าหน้าที่"
+                    ))],
+                )
+            )
 
 
 @app.route("/callback", methods=["POST"])
@@ -165,82 +205,36 @@ def handle_text(event):
             line_bot_api.reply_message(
                 ReplyMessageRequest(
                     reply_token=event.reply_token,
-                    messages=[
-                        TextMessage(
-                            text="📎 กรุณาส่งรูปสลิปเพื่อตรวจสอบการชำระเงิน\nหรือพิมพ์ 'บช' เพื่อดูเลขบัญชี"
-                        )
-                    ],
+                    messages=[TextMessage(
+                        text="📎 กรุณาส่งรูปสลิปเพื่อตรวจสอบการชำระเงิน\nหรือพิมพ์ 'บช' เพื่อดูเลขบัญชี"
+                    )],
                 )
             )
 
 
 @handler.add(MessageEvent, message=ImageMessageContent)
 def handle_image(event):
+    user_id = event.source.user_id
+
     with ApiClient(configuration) as api_client:
         line_bot_api = MessagingApi(api_client)
 
+        # ดึงรูปก่อน
         message_content = line_bot_api.get_message_content(event.message.id)
         image_data = b"".join(message_content)
 
-        result = verify_slip_with_easyslip(image_data)
-        status = result.get("status", 500)
-
-        if status == 200:
-            trans_ref = result.get("data", {}).get("transRef", "")
-
-            # ตรวจสอบสลิปซ้ำ
-            if trans_ref and is_slip_used(trans_ref):
-                line_bot_api.reply_message(
-                    ReplyMessageRequest(
-                        reply_token=event.reply_token,
-                        messages=[
-                            TextMessage(
-                                text=(
-                                    "⚠️ สลิปนี้เคยถูกใช้งานแล้ว\n\n"
-                                    f"🔖 เลขอ้างอิง: {trans_ref}\n\n"
-                                    "กรุณาส่งสลิปใหม่ที่ยังไม่เคยใช้ หรือติดต่อเจ้าหน้าที่"
-                                )
-                            )
-                        ],
-                    )
-                )
-                return
-
-            # บันทึกสลิปที่ใช้แล้ว
-            if trans_ref:
-                save_used_slip(trans_ref)
-
-            flex_body = build_success_flex(result)
-            line_bot_api.reply_message(
-                ReplyMessageRequest(
-                    reply_token=event.reply_token,
-                    messages=[
-                        FlexMessage(
-                            alt_text="✅ ตรวจสอบสลิปสำเร็จ",
-                            contents=FlexContainer.from_dict(flex_body),
-                        )
-                    ],
-                )
+        # ตอบกลับทันทีว่ากำลังตรวจสอบ
+        line_bot_api.reply_message(
+            ReplyMessageRequest(
+                reply_token=event.reply_token,
+                messages=[TextMessage(text="🔍 กำลังตรวจสอบสลิป กรุณารอสักครู่...")],
             )
-        else:
-            err_msg = result.get("message", "ไม่สามารถตรวจสอบสลิปได้")
-            line_bot_api.reply_message(
-                ReplyMessageRequest(
-                    reply_token=event.reply_token,
-                    messages=[
-                        TextMessage(
-                            text=(
-                                f"❌ ตรวจสอบสลิปไม่สำเร็จ\n"
-                                f"สาเหตุ: {err_msg}\n\n"
-                                "กรุณาตรวจสอบ:\n"
-                                "• สลิปต้องเป็นสลิปจริง ไม่ใช่ภาพถ่ายหน้าจอซ้ำ\n"
-                                "• รูปภาพต้องชัดเจน ครบถ้วน\n"
-                                "• หากมีปัญหา กรุณาติดต่อเจ้าหน้าที่"
-                            )
-                        )
-                    ],
-                )
-            )
+        )
+
+    # ประมวลผลใน background ไม่ block
+    t = threading.Thread(target=process_slip_async, args=(user_id, image_data))
+    t.daemon = True
+    t.start()
 
 
 @app.route("/", methods=["GET"])
