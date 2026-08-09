@@ -9,6 +9,7 @@ from linebot.v3.messaging import (
     Configuration,
     ApiClient,
     MessagingApi,
+    MessagingApiBlob,
     ReplyMessageRequest,
     PushMessageRequest,
     TextMessage,
@@ -218,10 +219,11 @@ def handle_image(event):
 
     with ApiClient(configuration) as api_client:
         line_bot_api = MessagingApi(api_client)
+        blob_api = MessagingApiBlob(api_client)
 
         # ดึงรูปก่อน
-        message_content = line_bot_api.get_message_content(event.message.id)
-        image_data = b"".join(message_content)
+        message_content = blob_api.get_message_content(event.message.id)
+        image_data = message_content
 
         # ตอบกลับทันทีว่ากำลังตรวจสอบ
         line_bot_api.reply_message(
