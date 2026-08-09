@@ -44,7 +44,7 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 # PEH / เปะ (เฉพาะฟีเจอร์นี้จากไฟล์อ้างอิง)
 # =========================
 _DEFAULT_ADMIN_UIDS = {
-    "U255dd67c1fef32fb0eae127149c7cadc",
+    "U92e11a31ee95453438aea73123c68fc0",
     "Uf7e207bfdd69d8e41806436fa7a86c14",
     "U163186c5013c8f1e4820291b7b1d86bd",
     "Uc2013ea8397da6d19cbe0f931a04c949",
