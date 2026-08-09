@@ -1,588 +1,782 @@
-# app.py
 import os
-import json
-import re
-import requests
+import hmac
+import hashlib
+import base64
 from datetime import datetime
-from flask import Flask, request, abort
-from linebot.v3 import WebhookHandler
-from linebot.v3.exceptions import InvalidSignatureError
-from linebot.v3.messaging import (
-    Configuration,
-    ApiClient,
-    MessagingApi,
-    MessagingApiBlob,
-    ReplyMessageRequest,
-    TextMessage,
-    FlexMessage,
-    FlexContainer,
-)
-from linebot.v3.webhooks import MessageEvent, ImageMessageContent, TextMessageContent
+
+import requests
+from flask import Flask, request, abort, jsonify
+from dotenv import load_dotenv
+
+load_dotenv()
 
 app = Flask(__name__)
 
-LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
-LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET")
-EASY_SLIP_API_KEY = os.environ.get("EASY_SLIP_API_KEY")
-OUR_ACCOUNT = "0748441328"
+# =========================
+# Environment variables
+# =========================
+LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "").strip()
+LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
+EASYSLIP_API_KEY = os.getenv("EASYSLIP_API_KEY", "").strip()
 
-configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
-handler = WebhookHandler(LINE_CHANNEL_SECRET)
+# EasySlip V2
+EASYSLIP_VERIFY_URL = "https://api.easyslip.com/v2/verify/bank"
 
-USED_SLIPS_FILE = "/tmp/used_slips.json"
+# Account shown by command "บช"
+ACCOUNT_NUMBER = os.getenv("TARGET_ACCOUNT_NUMBER", "0748441328").strip()
+ACCOUNT_BANK = os.getenv("TARGET_ACCOUNT_BANK", "กสิกรไทย").strip()
+ACCOUNT_BANK_SHORT = os.getenv("TARGET_ACCOUNT_BANK_SHORT", "KBANK").strip()
+ACCOUNT_NAME = os.getenv("TARGET_ACCOUNT_NAME", "กิตติเชษฐ์ บุญอินทร์").strip()
+
+# EasySlip V2 Account Matching
+VERIFY_MATCH_ACCOUNT = os.getenv("VERIFY_MATCH_ACCOUNT", "true").lower() == "true"
+
+# Maximum image size supported by EasySlip V2 = 4 MB
+MAX_IMAGE_BYTES = 4 * 1024 * 1024
+
+# Optional Railway PostgreSQL for a second duplicate-protection layer
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
 
-# ─────────────────────────── Slip storage ────────────────────────────
+# =========================
+# Optional PostgreSQL
+# =========================
+def get_db():
+    if not DATABASE_URL:
+        return None
 
-def load_used_slips() -> set:
+    import psycopg2
+
+    db_url = DATABASE_URL
+    if db_url.startswith("postgres://"):
+        db_url = "postgresql://" + db_url[len("postgres://"):]
+
+    return psycopg2.connect(db_url)
+
+
+def init_db():
+    if not DATABASE_URL:
+        print("[DB] DATABASE_URL not set. Using EasySlip duplicate checking only.")
+        return
+
+    conn = None
     try:
-        with open(USED_SLIPS_FILE, "r") as f:
-            return set(json.load(f))
-    except Exception:
-        return set()
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS used_slips (
+                id BIGSERIAL PRIMARY KEY,
+                trans_ref TEXT UNIQUE NOT NULL,
+                amount NUMERIC(12,2),
+                sender_name TEXT,
+                sender_bank TEXT,
+                receiver_name TEXT,
+                receiver_bank TEXT,
+                slip_date TEXT,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            )
+            """
+        )
+        conn.commit()
+        cur.close()
+        print("[DB] used_slips table ready.")
+    except Exception as exc:
+        print("[DB] init error:", exc)
+        if conn:
+            conn.rollback()
+    finally:
+        if conn:
+            conn.close()
 
 
-def save_used_slip(trans_ref: str):
-    slips = load_used_slips()
-    slips.add(trans_ref)
-    with open(USED_SLIPS_FILE, "w") as f:
-        json.dump(list(slips), f)
+def claim_trans_ref(data: dict) -> bool:
+    """
+    Returns:
+      True  = transRef was newly inserted
+      False = transRef already exists
+    If no DATABASE_URL is configured, returns True and relies on EasySlip.
+    """
+    if not DATABASE_URL:
+        return True
+
+    raw = data.get("rawSlip") or {}
+    trans_ref = str(raw.get("transRef") or "").strip()
+
+    if not trans_ref:
+        # If EasySlip didn't provide a transRef, don't block a valid response.
+        return True
+
+    amount = safe_float((((raw.get("amount") or {}).get("amount"))))
+    sender = raw.get("sender") or {}
+    receiver = raw.get("receiver") or {}
+
+    sender_name = get_party_name(sender)
+    receiver_name = get_party_name(receiver)
+    sender_bank = ((sender.get("bank") or {}).get("short") or "").strip()
+    receiver_bank = ((receiver.get("bank") or {}).get("short") or "").strip()
+    slip_date = str(raw.get("date") or "")
+
+    conn = None
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO used_slips
+                (trans_ref, amount, sender_name, sender_bank,
+                 receiver_name, receiver_bank, slip_date)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (trans_ref) DO NOTHING
+            RETURNING id
+            """,
+            (
+                trans_ref,
+                amount,
+                sender_name,
+                sender_bank,
+                receiver_name,
+                receiver_bank,
+                slip_date,
+            ),
+        )
+        inserted = cur.fetchone()
+        conn.commit()
+        cur.close()
+        return inserted is not None
+    except Exception as exc:
+        # Do not make the bot unusable if DB is temporarily unavailable.
+        print("[DB] claim_trans_ref error:", exc)
+        if conn:
+            conn.rollback()
+        return True
+    finally:
+        if conn:
+            conn.close()
 
 
-def is_slip_used(trans_ref: str) -> bool:
-    return trans_ref in load_used_slips()
+# =========================
+# Helpers
+# =========================
+def safe_float(value, default=0.0):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
-# ─────────────────────────── Helpers ─────────────────────────────────
-
-ACCOUNT_KEYWORDS = [
-    "บช", "บัญชี", "account", "โอนเงิน",
-    "เลขบัญชี", "ธนาคาร", "จ่ายเงิน", "ชำระ",
-]
-
-
-def _dig(d: dict, *paths):
-    """ลองหลาย key-path แล้วคืนค่าแรกที่เจอ"""
-    for path in paths:
-        cur = d
-        ok = True
-        for key in path:
-            if isinstance(cur, dict) and key in cur:
-                cur = cur[key]
-            else:
-                ok = False
-                break
-        if ok and cur not in (None, "", {}):
-            return cur
-    return ""
+def get_party_name(party: dict) -> str:
+    account = party.get("account") or {}
+    names = account.get("name") or {}
+    return (
+        str(names.get("th") or "").strip()
+        or str(names.get("en") or "").strip()
+        or "-"
+    )
 
 
-def _format_date(raw: str) -> str:
-    if not raw:
+def verify_line_signature(raw_body: bytes, signature: str) -> bool:
+    if not LINE_CHANNEL_SECRET or not signature:
+        return False
+
+    digest = hmac.new(
+        LINE_CHANNEL_SECRET.encode("utf-8"),
+        raw_body,
+        hashlib.sha256,
+    ).digest()
+
+    expected = base64.b64encode(digest).decode("utf-8")
+    return hmac.compare_digest(expected, signature)
+
+
+def line_headers():
+    return {
+        "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+    }
+
+
+def reply_line(reply_token: str, messages: list):
+    url = "https://api.line.me/v2/bot/message/reply"
+    payload = {
+        "replyToken": reply_token,
+        "messages": messages[:5],
+    }
+
+    resp = requests.post(
+        url,
+        headers=line_headers(),
+        json=payload,
+        timeout=15,
+    )
+
+    if not resp.ok:
+        print("[LINE] reply failed:", resp.status_code, resp.text)
+
+    return resp
+
+
+def text_message(text: str) -> dict:
+    return {
+        "type": "text",
+        "text": text,
+    }
+
+
+ACCOUNT_MESSAGE = f"""━━━━━━━━━━━━━━
+🏦 แจ้งเลขบัญชีฝากเงิน
+🔢 เลขบัญชี : {ACCOUNT_NUMBER}
+🏛 ธนาคาร : {ACCOUNT_BANK}
+👤 ชื่อบัญชี : {ACCOUNT_NAME}
+━━━━━━━━━━━━━━
+⚠️ เพื่อป้องกันมิจฉาชีพ
+ชื่อผู้ฝาก-ถอน ต้องเป็นชื่อเดียวกันเท่านั้น ✅"""
+
+
+def download_line_image(message_id: str) -> bytes:
+    url = f"https://api-data.line.me/v2/bot/message/{message_id}/content"
+    resp = requests.get(
+        url,
+        headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"},
+        timeout=20,
+    )
+    resp.raise_for_status()
+    return resp.content
+
+
+def verify_with_easyslip(image_bytes: bytes) -> dict:
+    """
+    EasySlip API V2:
+      POST https://api.easyslip.com/v2/verify/bank
+      multipart/form-data:
+        image
+        matchAccount=true
+        checkDuplicate=true
+    """
+    headers = {
+        "Authorization": f"Bearer {EASYSLIP_API_KEY}",
+    }
+
+    files = {
+        "image": ("slip.jpg", image_bytes, "image/jpeg"),
+    }
+
+    form = {
+        "checkDuplicate": "true",
+        "matchAccount": "true" if VERIFY_MATCH_ACCOUNT else "false",
+        "remark": "LINE BOT เถ้าแก่น้อย",
+    }
+
+    resp = requests.post(
+        EASYSLIP_VERIFY_URL,
+        headers=headers,
+        files=files,
+        data=form,
+        timeout=30,
+    )
+
+    try:
+        payload = resp.json()
+    except ValueError:
+        payload = {
+            "success": False,
+            "error": {
+                "code": "EASYSLIP_INVALID_RESPONSE",
+                "message": resp.text[:500] or "EasySlip response is not JSON",
+            },
+        }
+
+    payload["_http_status"] = resp.status_code
+    return payload
+
+
+def normalize_easyslip_error(payload: dict):
+    """
+    EasySlip documentation shows both:
+      {"success": false, "error": {"code": "...", "message": "..."}}
+    and some reference examples:
+      {"status": 400, "message": "duplicate_slip", "data": {...}}
+    This function supports both.
+    """
+    error = payload.get("error") or {}
+
+    code = str(
+        error.get("code")
+        or payload.get("message")
+        or "UNKNOWN_ERROR"
+    ).strip()
+
+    message = str(
+        error.get("message")
+        or payload.get("message")
+        or "เกิดข้อผิดพลาดในการตรวจสอบสลิป"
+    ).strip()
+
+    return code.lower(), message
+
+
+def display_date(value: str) -> str:
+    if not value:
         return "-"
+
     try:
-        dt = datetime.fromisoformat(raw)
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
         return dt.strftime("%d/%m/%Y %H:%M")
     except Exception:
-        return raw
+        return value
 
 
-def _get_receiver_account(receiver: dict) -> str:
-    """ดึงเลขบัญชีผู้รับ รองรับทั้ง V1 และ V2 field"""
-    return _dig(
-        receiver,
-        ["accountNo"],      # V2 /verify/bank
-        ["account", "bank", "account"],     # V1 masked
-        ["account", "proxy", "account"],    # V1 PromptPay
-        ["account", "value"],
-    )
-
-
-def account_matches(slip_acc: str, our_acc: str) -> bool:
-    """เทียบเลขบัญชี รองรับเลข mask เช่น xxx-x-x1234-x"""
-    if not slip_acc:
-        return True  # ไม่มีข้อมูล → ผ่าน (พึ่ง EasySlip dashboard config แทน)
-    clean = re.sub(r"[-\s]", "", slip_acc)
-    known_parts = [p for p in re.split(r"x+", clean, flags=re.IGNORECASE) if p]
-    return all(p in our_acc for p in known_parts) if known_parts else True
-
-
-# ─────────────────────────── EasySlip V2 API ─────────────────────────
-
-def verify_slip_with_easyslip(image_content: bytes) -> dict:
-    """
-    เรียก EasySlip V2 endpoint: POST https://api.easyslip.com/v2/verify/bank
-    Header: Authorization: Bearer <API_KEY>
-    Body  : multipart/form-data  field "file"
-    """
-    url = "https://api.easyslip.com/v2/verify/bank"
-    headers = {"Authorization": f"Bearer {EASY_SLIP_API_KEY}"}
-    files = {"file": ("slip.jpg", image_content, "image/jpeg")}
-    try:
-        response = requests.post(url, headers=headers, files=files, timeout=30)
-        data = response.json()
-        # Log raw response ไว้ดูใน Cloud logs
-        app.logger.info("EasySlip V2 raw response: %s",
-                        json.dumps(data, ensure_ascii=False))
-        return data
-    except Exception as e:
-        app.logger.error("EasySlip V2 request error: %s", str(e))
-        return {"status": 500, "message": str(e)}
-
-
-# ─────────────────────────── Flex builders ───────────────────────────
-
-def flex_success(data: dict) -> dict:
-    p = data.get("data", {})
-
-    amount_val = _dig(p, ["amount", "amount"], ["amount"]) or 0
-    try:
-        amount = f"{float(amount_val):,.2f}"
-    except Exception:
-        amount = str(amount_val) or "-"
-
-    sender = (
-        _dig(p,["sender", "account", "name", "th"],
-             ["sender", "account", "name", "en"],
-             ["sender", "name"],
-             ["sender", "displayName"]) or "-"
-    )
-    receiver = (
-        _dig(p,
-             ["receiver", "account", "name", "th"],
-             ["receiver", "account", "name", "en"],
-             ["receiver", "name"],
-             ["receiver", "displayName"]) or "-"
-    )
-    bank = (
-        _dig(p,
-             ["receiver", "bank", "name"],
-             ["receiver", "bank", "short"],
-             ["receiver", "bankName"]) or "-"
-    )
-    date_str = _format_date(p.get("date", "") or p.get("transDate", ""))
-    trans_ref = p.get("transRef", "") or p.get("referenceNo", "-")
-
+# =========================
+# Flex Message
+# =========================
+def flex_row(label: str, value: str, value_color="#123F5A"):
     return {
-        "type": "bubble", "size": "mega",
-        "header": {
-            "type": "box", "layout": "vertical", "paddingAll": "20px",
-            "backgroundColor": "#2ECC71",
-            "contents": [{
-                "type": "box", "layout": "horizontal", "contents": [
-                    {"type": "text", "text": "✅", "size": "xl", "flex": 0},
-                    {"type": "text", "text": " สลิปถูกต้อง", "size": "xl",
-                     "weight": "bold", "color": "#ffffff", "flex": 1},
-                ]
-            }]
-        },
-        "body": {
-            "type": "box", "layout": "vertical", "spacing": "lg",
-            "backgroundColor": "#F0FFF4", "paddingAll": "20px",
-            "contents": [
-                {"type": "text", "text": f"฿{amount}", "size": "3xl",
-                 "weight": "bold", "color": "#1a3c5e"},
-                {"type": "separator", "color": "#C8E6C9"},
-                {
-                    "type": "box", "layout": "vertical", "spacing": "md",
-                    "contents": [
-                        {
-                            "type": "box", "layout": "horizontal", "spacing": "md",
-                            "contents": [
-                                {
-                                    "type": "box", "layout": "vertical", "flex": 1,
-                                    "backgroundColor": "#E8F5E9", "cornerRadius": "12px",
-                                    "paddingAll": "12px", "spacing": "xs",
-                                    "contents": [
-                                        {"type": "text", "text": "👤 ผู้โอน",
-                                         "size": "xs", "color": "#666666"},
-                                        {"type": "text", "text": sender, "size": "sm",
-                                         "weight": "bold", "color": "#1a3c5e", "wrap": True},
-                                    ]
-                                },
-                                {
-                                    "type": "box", "layout": "vertical", "flex": 1,
-                                    "backgroundColor": "#E8F5E9", "cornerRadius": "12px",
-                                    "paddingAll": "12px", "spacing": "xs",
-                                    "contents": [
-                                        {"type": "text", "text": "🏦 ผู้รับ",
-                                         "size": "xs", "color": "#666666"},
-                                        {"type": "text", "text": receiver, "size": "sm",
-                                         "weight": "bold", "color": "#1a3c5e", "wrap": True},
-                                    ]
-                                },
-                            ]
-                        },
-                        {
-                            "type": "box", "layout": "horizontal", "spacing": "md",
-                            "contents": [
-                                {
-                                    "type": "box", "layout": "vertical", "flex": 1,
-                                    "backgroundColor": "#E8F5E9", "cornerRadius": "12px",
-                                    "paddingAll": "12px", "spacing": "xs",
-                                    "contents": [
-                                        {"type": "text", "text": "🏛 ธนาคาร",
-                                         "size": "xs", "color": "#666666"},
-                                        {"type": "text", "text": bank, "size": "sm",
-                                         "weight": "bold", "color": "#1a3c5e", "wrap": True},
-                                    ]
-                                },
-                                {
-                                    "type": "box", "layout": "vertical", "flex": 1,
-                                    "backgroundColor": "#E8F5E9", "cornerRadius": "12px",
-                                    "paddingAll": "12px", "spacing": "xs",
-                                    "contents": [
-                                        {"type": "text", "text": "📅 วันที่",
-                                         "size": "xs", "color": "#666666"},
-                                        {"type": "text", "text": date_str, "size": "sm",
-                                         "weight": "bold", "color": "#1a3c5e", "wrap": True},
-                                    ]
-                                },
-                            ]
-                        },
-                        {
-                            "type": "box", "layout": "vertical",
-                            "backgroundColor": "#E8F5E9", "cornerRadius": "12px",
-                            "paddingAll": "12px", "spacing": "xs",
-                            "contents": [
-                                {"type": "text", "text": "🔖 เลขอ้างอิง",
-                                 "size": "xs", "color": "#666666"},
-                                {"type": "text", "text": str(trans_ref), "size": "sm",
-                                 "weight": "bold", "color": "#1a3c5e", "wrap": True},
-                            ]
-                        },
-                    ]
-                },
-            ]
-        },
-        "footer": {
-            "type": "box", "layout": "horizontal", "spacing": "sm",
-            "backgroundColor": "#E8F5E9", "paddingAll": "14px",
-            "contents": [
-                {"type": "text", "text": "🔒", "size": "sm", "flex": 0},
-                {"type": "text", "text": "  ตรวจสอบโดยระบบอัตโนมัติ",
-                 "size": "xs", "color": "#2ECC71", "weight": "bold"},
-            ]
-        }
-    }
-
-
-def _info_card(label: str, value: str, bg: str = "#FFF3F3") -> dict:
-    return {
-        "type": "box", "layout": "vertical",
-        "backgroundColor": bg, "cornerRadius": "12px",
-        "paddingAll": "12px", "spacing": "xs", "margin": "sm",
+        "type": "box",
+        "layout": "horizontal",
+        "margin": "md",
         "contents": [
-            {"type": "text", "text": label, "size": "xs", "color": "#888888"},
-            {"type": "text", "text": value or "-", "size": "sm",
-             "weight": "bold", "color": "#333333", "wrap": True},
-        ]
+            {
+                "type": "text",
+                "text": label,
+                "size": "sm",
+                "color": "#6B7C85",
+                "flex": 4,
+                "wrap": True,
+            },
+            {
+                "type": "text",
+                "text": str(value),
+                "size": "sm",
+                "color": value_color,
+                "weight": "bold",
+                "align": "end",
+                "flex": 6,
+                "wrap": True,
+            },
+        ],
     }
 
 
-def flex_wrong_account(receiver_account: str) -> dict:
-    return {
-        "type": "bubble", "size": "mega",
+def success_flex(data: dict) -> dict:
+    raw = data.get("rawSlip") or {}
+    amount = safe_float(((raw.get("amount") or {}).get("amount")))
+    sender = raw.get("sender") or {}
+    receiver = raw.get("receiver") or {}
+
+    sender_name = get_party_name(sender)
+    receiver_name = get_party_name(receiver)
+    sender_bank = ((sender.get("bank") or {}).get("short") or "-")
+    receiver_bank = ((receiver.get("bank") or {}).get("short") or "-")
+    trans_ref = str(raw.get("transRef") or "-")
+    date_text = display_date(str(raw.get("date") or ""))
+
+    bubble = {
+        "type": "bubble",
+        "size": "mega",
         "header": {
-            "type": "box", "layout": "vertical", "paddingAll": "20px",
-            "backgroundColor": "#E74C3C",
-            "contents": [{
-                "type": "box", "layout": "horizontal", "contents": [
-                    {"type": "text", "text": "❌", "size": "xl", "flex": 0},
-                    {"type": "text", "text": " บัญชีไม่ถูกต้อง", "size": "xl",
-                     "weight": "bold", "color": "#ffffff", "flex": 1},
-                ]
-            }]
-        },
-        "body": {
-            "type": "box", "layout": "vertical", "paddingAll": "20px",
-            "backgroundColor": "#FFF5F5", "spacing": "xs",
-            "contents": [
-                {"type": "text", "text": "สลิปนี้โอนไปบัญชีอื่น ไม่ใช่บัญชีของเรา",
-                 "size": "sm", "color": "#666666", "wrap": True},
-                _info_card("🏦 บัญชีในสลิป", receiver_account or "-"),
-                _info_card("✅ บัญชีที่ถูกต้อง", OUR_ACCOUNT, "#F0FFF4"),
-                _info_card("🏛 ธนาคาร", "กสิกรไทย", "#F0FFF4"),
-                _info_card("👤 ชื่อบัญชี", "กิตติเชษฐ์ บุญอินทร์", "#F0FFF4"),]
-        },
-        "footer": {
-            "type": "box", "layout": "vertical", "paddingAll": "14px",
-            "backgroundColor": "#FFF0F0",
-            "contents": [{"type": "text", "text": "พิมพ์ 'บช' เพื่อดูเลขบัญชีที่ถูกต้อง",
-                          "size": "xs", "color": "#E74C3C", "align": "center"}]
-        }
-    }
-
-
-def flex_duplicate(trans_ref: str) -> dict:
-    return {
-        "type": "bubble", "size": "mega",
-        "header": {
-            "type": "box", "layout": "vertical", "paddingAll": "20px",
-            "backgroundColor": "#E67E22",
-            "contents": [{
-                "type": "box", "layout": "horizontal", "contents": [
-                    {"type": "text", "text": "⚠️", "size": "xl", "flex": 0},
-                    {"type": "text", "text": " สลิปซ้ำ", "size": "xl",
-                     "weight": "bold", "color": "#ffffff", "flex": 1},
-                ]
-            }]
-        },
-        "body": {
-            "type": "box", "layout": "vertical", "paddingAll": "20px",
-            "backgroundColor": "#FFFBF0", "spacing": "xs",
-            "contents": [
-                {"type": "text", "text": "สลิปนี้เคยถูกใช้งานไปแล้ว",
-                 "size": "sm", "color": "#666666", "wrap": True},
-                {
-                    "type": "box", "layout": "vertical", "backgroundColor": "#FFF3E0",
-                    "cornerRadius": "12px", "paddingAll": "12px", "margin": "md",
-                    "spacing": "xs",
-                    "contents": [
-                        {"type": "text", "text": "🔖 เลขอ้างอิง",
-                         "size": "xs", "color": "#888888"},
-                        {"type": "text", "text": str(trans_ref), "size": "sm",
-                         "weight": "bold", "color": "#333333", "wrap": True},
-                    ]
-                },
-            ]
-        },
-        "footer": {
-            "type": "box", "layout": "vertical", "paddingAll": "14px",
-            "backgroundColor": "#FFF3E0",
-            "contents": [{"type": "text",
-                          "text": "กรุณาส่งสลิปใหม่ หรือติดต่อเจ้าหน้าที่",
-                          "size": "xs", "color": "#E67E22", "align": "center"}]
-        }
-    }
-
-
-def flex_pending() -> dict:
-    return {
-        "type": "bubble", "size": "mega",
-        "header": {
-            "type": "box", "layout": "vertical", "paddingAll": "20px",
-            "backgroundColor": "#8E44AD",
-            "contents": [{
-                "type": "box", "layout": "horizontal", "contents": [
-                    {"type": "text", "text": "⏳", "size": "xl", "flex": 0},
-                    {"type": "text", "text": " กำลังประมวลผล", "size": "xl",
-                     "weight": "bold", "color": "#ffffff", "flex": 1},
-                ]
-            }]
-        },
-        "body": {
-            "type": "box", "layout": "vertical", "paddingAll": "20px",
-            "backgroundColor": "#FAF5FF", "spacing": "sm",
-            "contents": [
-                {"type": "text", "text": "ธนาคารยังประมวลผลสลิปไม่เสร็จ",
-                 "size": "sm", "color": "#666666", "wrap": True},
-                {
-                    "type": "box", "layout": "vertical", "backgroundColor": "#EDE7F6",
-                    "cornerRadius": "12px", "paddingAll": "12px", "margin": "md",
-                    "contents": [
-                        {"type": "text",
-                         "text": "💡 รอ 1-2 นาที แล้วส่งสลิปใหม่อีกครั้ง",
-                         "size": "sm", "color": "#6A1B9A", "wrap": True},
-                    ]
-                },
-            ]
-        },
-        "footer": {
-            "type": "box", "layout": "vertical", "paddingAll": "14px",
-            "backgroundColor": "#EDE7F6",
-            "contents": [{"type": "text",
-                          "text": "พบบ่อยในสลิปธนาคารกรุงเทพ / กรุงไทย",
-                          "size": "xs", "color": "#8E44AD", "align": "center"}]
-        }
-    }
-
-
-def flex_error(reason: str) -> dict:
-    return {
-        "type": "bubble", "size": "mega",
-        "header": {
-            "type": "box", "layout": "vertical", "paddingAll": "20px",
-            "backgroundColor": "#7F8C8D",
-            "contents": [{
-                "type": "box", "layout": "horizontal", "contents": [
-                    {"type": "text", "text": "❌", "size": "xl", "flex": 0},
-                    {"type": "text", "text": " ตรวจสอบไม่สำเร็จ", "size": "xl",
-                     "weight": "bold", "color": "#ffffff", "flex": 1},
-                ]
-            }]
-        },
-        "body": {
-            "type": "box", "layout": "vertical", "paddingAll": "20px",
-            "backgroundColor": "#F8F9FA", "spacing": "xs",
+            "type": "box",
+            "layout": "vertical",
+            "backgroundColor": "#06C755",
+            "paddingAll": "20px",
             "contents": [
                 {
-                    "type": "box", "layout": "vertical", "backgroundColor": "#ECEFF1",
-                    "cornerRadius": "12px", "paddingAll": "12px", "margin": "sm",
-                    "spacing": "xs",
+                    "type": "box",
+                    "layout": "horizontal",
                     "contents": [
-                        {"type": "text", "text": "สาเหตุ", "size": "xs", "color": "#888888"},
-                        {"type": "text",
-                         "text": reason or "ไม่สามารถตรวจสอบสลิปได้",
-                         "size": "sm", "weight": "bold", "color": "#333333", "wrap": True},
-                    ]
-                },{
-                    "type": "box", "layout": "vertical", "backgroundColor": "#ECEFF1",
-                    "cornerRadius": "12px", "paddingAll": "12px", "margin": "sm",
-                    "contents": [
-                        {"type": "text",
-                         "text": "• สลิปต้องชัดเจน ไม่ใช่ภาพถ่ายซ้ำ\n• รูปต้องครบถ้วน ไม่ถูกตัด",
-                         "size": "sm", "color": "#555555", "wrap": True},]
-                },
-            ]
-        },
-        "footer": {
-            "type": "box", "layout": "vertical", "paddingAll": "14px",
-            "backgroundColor": "#ECEFF1",
-            "contents": [{"type": "text", "text": "หากมีปัญหา กรุณาติดต่อเจ้าหน้าที่",
-                          "size": "xs", "color": "#7F8C8D", "align": "center"}]
-        }
-    }
-
-
-def flex_account() -> dict:
-    return {
-        "type": "bubble", "size": "mega",
-        "header": {
-            "type": "box", "layout": "vertical", "paddingAll": "20px",
-            "backgroundColor": "#2980B9",
-            "contents": [{
-                "type": "box", "layout": "horizontal", "contents": [
-                    {"type": "text", "text": "🏦", "size": "xl", "flex": 0},
-                    {"type": "text", "text": " บัญชีรับโอนเงิน", "size": "xl",
-                     "weight": "bold", "color": "#ffffff", "flex": 1},
-                ]
-            }]
-        },
-        "body": {
-            "type": "box", "layout": "vertical", "paddingAll": "20px",
-            "backgroundColor": "#F0F8FF", "spacing": "sm",
-            "contents": [
-                {
-                    "type": "box", "layout": "vertical", "backgroundColor": "#DBEAFE",
-                    "cornerRadius": "16px", "paddingAll": "16px", "spacing": "sm",
-                    "contents": [
-                        {"type": "text", "text": "กสิกรไทย (KBANK)",
-                         "size": "md", "weight": "bold", "color": "#1a3c5e"},
-                        {"type": "text", "text": "0748441328",
-                         "size": "xxl", "weight": "bold", "color": "#2980B9"},
-                        {"type": "text", "text": "กิตติเชษฐ์ บุญอินทร์",
-                         "size": "sm", "color": "#555555"},
-                    ]
-                },
-                {
-                    "type": "box", "layout": "horizontal", "backgroundColor": "#FFF3CD",
-                    "cornerRadius": "10px", "paddingAll": "10px", "margin": "md",
-                    "contents": [
-                        {"type": "text", "text": "⚠️ ", "flex": 0, "size": "sm"},
-                        {"type": "text",
-                         "text": "ชื่อผู้ฝาก-ถอน ต้องเป็นชื่อเดียวกันเท่านั้น",
-                         "size": "xs", "color": "#856404", "flex": 1, "wrap": True},
-                    ]
+                        {
+                            "type": "text",
+                            "text": "✓",
+                            "size": "3xl",
+                            "weight": "bold",
+                            "color": "#FFFFFF",
+                            "flex": 0,
+                        },
+                        {
+                            "type": "text",
+                            "text": "สลิปถูกต้อง",
+                            "size": "xl",
+                            "weight": "bold",
+                            "color": "#FFFFFF",
+                            "gravity": "center",
+                            "margin": "md",
+                            "flex": 1,
+                        },
+                    ],
                 }
-            ]
-        }
+            ],
+        },
+        "body": {
+            "type": "box",
+            "layout": "vertical",
+            "backgroundColor": "#F5FBF5",
+            "paddingAll": "22px",
+            "contents": [
+                {
+                    "type": "text",
+                    "text": f"฿{amount:,.2f}",
+                    "size": "3xl",
+                    "weight": "bold",
+                    "color": "#0B4A6B",
+                },
+                {
+                    "type": "text",
+                    "text": "ตรวจสอบกับ EasySlip API V2 สำเร็จ",
+                    "size": "sm",
+                    "color": "#7A8C94",
+                    "margin": "sm",
+                },
+                {
+                    "type": "separator",
+                    "margin": "xl",
+                    "color": "#D9E7DB",
+                },
+                flex_row("ผู้โอน", sender_name),
+                flex_row("ธนาคารผู้โอน", sender_bank),
+                flex_row("ผู้รับ", receiver_name),
+                flex_row("ธนาคารผู้รับ", receiver_bank),
+                flex_row("วันที่", date_text),
+                flex_row("เลขอ้างอิง", trans_ref[-18:] if len(trans_ref) > 18 else trans_ref),
+                {
+                    "type": "separator",
+                    "margin": "xl",
+                    "color": "#D9E7DB",
+                },
+                {
+                    "type": "box",
+                    "layout": "horizontal",
+                    "margin": "lg",
+                    "contents": [
+                        {
+                            "type": "text",
+                            "text": "✓",
+                            "size": "xl",
+                            "weight": "bold",
+                            "color": "#2B78B8",
+                            "flex": 0,
+                        },
+                        {
+                            "type": "box",
+                            "layout": "vertical",
+                            "margin": "md",
+                            "contents": [
+                                {
+                                    "type": "text",
+                                    "text": "สลิปจริงตรวจสอบโดย เถ้าแก่น้อย",
+                                    "weight": "bold",
+                                    "size": "sm",
+                                    "color": "#1A5276",
+                                    "wrap": True,
+                                },
+                                {
+                                    "type": "text",
+                                    "text": "ไม่สามารถใช้สลิปซ้ำได้",
+                                    "size": "xs",
+                                    "color": "#66757F",
+                                    "margin": "xs",
+                                },
+                            ],
+                        },
+                    ],
+                },
+            ],
+        },
+    }
+
+    return {
+        "type": "flex",
+        "altText": f"สลิปถูกต้อง ฿{amount:,.2f}",
+        "contents": bubble,
     }
 
 
-# ─────────────────────────── Reply helper ────────────────────────────
+ERROR_TEXTS = {
+    "duplicate_slip": (
+        "สลิปนี้ถูกใช้แล้ว",
+        "ไม่สามารถใช้สลิปซ้ำได้ กรุณาใช้สลิปใหม่เท่านั้น",
+    ),
+    "slip_not_found": (
+        "ไม่พบข้อมูลสลิป",
+        "กรุณาส่งรูปสลิปที่มี QR Code ชัดเจน",
+    ),
+    "qrcode_not_found": (
+        "ไม่พบ QR Code",
+        "กรุณาส่งรูปสลิปเต็มใบและให้ QR Code มองเห็นชัดเจน",
+    ),
+    "invalid_image": (
+        "รูปภาพไม่ถูกต้อง",
+        "รองรับ JPEG, PNG, GIF และ WebP",
+    ),
+    "invalid_image_format": (
+        "รูปภาพไม่ถูกต้อง",
+        "รองรับ JPEG, PNG, GIF และ WebP",
+    ),
+    "image_size_too_large": (
+        "รูปภาพใหญ่เกินไป",
+        "EasySlip V2 รองรับรูปไม่เกิน 4 MB",
+    ),
+    "slip_expired": (
+        "สลิปหมดอายุ",
+        "กรุณาใช้สลิปที่ยังสามารถตรวจสอบได้",
+    ),
+    "slip_pending": (
+        "สลิปกำลังรอตรวจสอบ",
+        "หากเป็นธนาคารกรุงเทพ กรุณารอสักครู่แล้วลองใหม่",
+    ),
+    "account_not_match": (
+        "บัญชีผู้รับไม่ตรง",
+        "สลิปนี้ไม่ได้โอนเข้าบัญชีที่กำหนด",
+    ),
+    "amount_not_match": (
+        "จำนวนเงินไม่ตรง",
+        "ยอดเงินในสลิปไม่ตรงกับยอดที่กำหนด",
+    ),
+    "quota_exceeded": (
+        "โควต้า EasySlip หมด",
+        "กรุณาติดต่อผู้ดูแลระบบ",
+    ),
+    "unauthorized": (
+        "EasySlip API Key ไม่ถูกต้อง",
+        "กรุณาตรวจสอบ EASYSLIP_API_KEY",
+    ),
+    "forbidden": (
+        "EasySlip ไม่อนุญาตให้ใช้งาน",
+        "กรุณาตรวจสอบสิทธิ์ API หรือ IP Whitelist",
+    ),
+}
 
-def reply_flex(reply_token: str, alt: str, body: dict):
-    with ApiClient(configuration) as api_client:
-        MessagingApi(api_client).reply_message(
-            ReplyMessageRequest(
-                reply_token=reply_token,
-                messages=[FlexMessage(
-                    alt_text=alt,
-                    contents=FlexContainer.from_dict(body),
-                )],
-            )
+
+def error_flex(code: str, detail: str = "") -> dict:
+    normalized = (code or "unknown_error").lower()
+    title, desc = ERROR_TEXTS.get(
+        normalized,
+        ("ตรวจสอบสลิปไม่สำเร็จ", detail or "กรุณาลองใหม่อีกครั้ง"),
+    )
+
+    # Dedicated copy for duplicate slips
+    if normalized == "duplicate_slip":
+        badge = "!"
+        header = "#E53935"
+    else:
+        badge = "×"
+        header = "#D64545"
+
+    bubble = {
+        "type": "bubble",
+        "size": "mega",
+        "header": {
+            "type": "box",
+            "layout": "vertical",
+            "backgroundColor": header,
+            "paddingAll": "20px",
+            "contents": [
+                {
+                    "type": "box",
+                    "layout": "horizontal",
+                    "contents": [
+                        {
+                            "type": "text",
+                            "text": badge,
+                            "size": "3xl",
+                            "weight": "bold",
+                            "color": "#FFFFFF",
+                            "flex": 0,
+                        },
+                        {
+                            "type": "text",
+                            "text": title,
+                            "size": "xl",
+                            "weight": "bold",
+                            "color": "#FFFFFF",
+                            "gravity": "center",
+                            "margin": "md",
+                            "flex": 1,
+                            "wrap": True,
+                        },
+                    ],
+                }
+            ],
+        },
+        "body": {
+            "type": "box",
+            "layout": "vertical",
+            "backgroundColor": "#FFF8F7",
+            "paddingAll": "22px",
+            "contents": [
+                {
+                    "type": "text",
+                    "text": desc,
+                    "size": "md",
+                    "weight": "bold",
+                    "color": "#8A2F2F",
+                    "wrap": True,
+                },
+                {
+                    "type": "separator",
+                    "margin": "xl",
+                    "color": "#F0D5D2",
+                },
+                {
+                    "type": "text",
+                    "text": "เถ้าแก่น้อย • EasySlip API V2",
+                    "size": "sm",
+                    "color": "#52636C",
+                    "weight": "bold",
+                    "margin": "lg",
+                },
+                {
+                    "type": "text",
+                    "text": "ระบบป้องกันการนำสลิปเดิมกลับมาใช้ซ้ำ",
+                    "size": "xs",
+                    "color": "#7A8C94",
+                    "margin": "xs",
+                    "wrap": True,
+                },
+            ],
+        },
+    }
+
+    return {
+        "type": "flex",
+        "altText": title,
+        "contents": bubble,
+    }
+
+
+# =========================
+# Event handlers
+# =========================
+def handle_text(event: dict):
+    text = str(((event.get("message") or {}).get("text") or "")).strip()
+    reply_token = event.get("replyToken")
+
+    if text == "บช":
+        reply_line(reply_token, [text_message(ACCOUNT_MESSAGE)])
+
+
+def handle_image(event: dict):
+    reply_token = event.get("replyToken")
+    message = event.get("message") or {}
+    message_id = str(message.get("id") or "")
+
+    if not EASYSLIP_API_KEY:
+        reply_line(
+            reply_token,
+            [error_flex("unauthorized", "ยังไม่ได้ตั้งค่า EASYSLIP_API_KEY")],
         )
+        return
 
-
-# ─────────────────────────── Routes ──────────────────────────────────
-
-@app.route("/callback", methods=["POST"])
-def callback():
-    signature = request.headers.get("X-Line-Signature", "")
-    body = request.get_data(as_text=True)
     try:
-        handler.handle(body, signature)
-    except InvalidSignatureError:
-        abort(400)
-    return "OK"
+        image_bytes = download_line_image(message_id)
+    except Exception as exc:
+        print("[LINE] image download error:", exc)
+        reply_line(
+            reply_token,
+            [error_flex("image_download_error", "ดาวน์โหลดรูปจาก LINE ไม่สำเร็จ")],
+        )
+        return
 
+    if len(image_bytes) > MAX_IMAGE_BYTES:
+        reply_line(reply_token, [error_flex("image_size_too_large")])
+        return
 
-@handler.add(MessageEvent, message=TextMessageContent)
-def handle_text(event):
-    text = event.message.text.strip().lower()
-    if any(kw in text for kw in ACCOUNT_KEYWORDS):
-        reply_flex(event.reply_token, "🏦 แจ้งเลขบัญชีฝากเงิน", flex_account())
-    else:
-        with ApiClient(configuration) as api_client:
-            MessagingApi(api_client).reply_message(
-                ReplyMessageRequest(
-                    reply_token=event.reply_token,
-                    messages=[TextMessage(
-                        text="📎 กรุณาส่งรูปสลิปเพื่อตรวจสอบการชำระเงิน\n"
-                             "หรือพิมพ์ 'บช' เพื่อดูเลขบัญชี"
-                    )],
-                )
-            )
+    try:
+        result = verify_with_easyslip(image_bytes)
+    except requests.RequestException as exc:
+        print("[EasySlip] request error:", exc)
+        reply_line(
+            reply_token,
+            [error_flex("easyslip_unavailable", "เชื่อมต่อ EasySlip ไม่สำเร็จ กรุณาลองใหม่")],
+        )
+        return
 
+    # EasySlip V2 success
+    if result.get("success") is True:
+        data = result.get("data") or {}
 
-@handler.add(MessageEvent, message=ImageMessageContent)
-def handle_image(event):
-    # 1. ดึงรูปจาก LINE
-    with ApiClient(configuration) as api_client:
-        blob_api = MessagingApiBlob(api_client)
-        image_data = blob_api.get_message_content(event.message.id)
-
-    # 2. ส่งไปตรวจที่ EasySlip V2
-    result = verify_slip_with_easyslip(image_data)
-    status = result.get("status", 500)
-
-    if status == 200:
-        payment = result.get("data", {})
-        trans_ref = payment.get("transRef", "") or payment.get("referenceNo", "")
-
-        # 3. ตรวจเลขบัญชีผู้รับ
-        receiver = payment.get("receiver", {})
-        receiver_account = _get_receiver_account(receiver)
-
-        if not account_matches(receiver_account, OUR_ACCOUNT):
-            reply_flex(event.reply_token, "❌ บัญชีผู้รับไม่ถูกต้อง",
-                       flex_wrong_account(receiver_account))
+        # EasySlip can expose isDuplicate in success data.
+        if data.get("isDuplicate") is True:
+            reply_line(reply_token, [error_flex("duplicate_slip")])
             return
 
-        # 4. ตรวจสลิปซ้ำ
-        if trans_ref and is_slip_used(trans_ref):
-            reply_flex(event.reply_token, "⚠️ สลิปซ้ำ", flex_duplicate(trans_ref))
+        # When matchAccount=true, require a matched account.
+        if VERIFY_MATCH_ACCOUNT and data.get("matchedAccount") is None:
+            reply_line(reply_token, [error_flex("account_not_match")])
             return
 
-        # 5. บันทึกและแจ้งสำเร็จ
-        if trans_ref:
-            save_used_slip(trans_ref)reply_flex(event.reply_token, "✅ ตรวจสอบสลิปสำเร็จ", flex_success(result))
+        # Optional second duplicate-protection layer using PostgreSQL.
+        if not claim_trans_ref(data):
+            reply_line(reply_token, [error_flex("duplicate_slip")])
+            return
 
-    else:
-        err = result.get("message", "") or result.get("error", "")
-        if "pending" in str(err).lower():
-            reply_flex(event.reply_token, "⏳ สลิปอยู่ระหว่างประมวลผล", flex_pending())
-        else:
-            reply_flex(event.reply_token, "❌ ตรวจสอบไม่สำเร็จ",
-                       flex_error(err or "ไม่สามารถตรวจสอบสลิปได้"))
+        reply_line(reply_token, [success_flex(data)])
+        return
+
+    code, detail = normalize_easyslip_error(result)
+
+    # Support uppercase error codes from some V2 responses.
+    alias = {
+        "slip_not_found": "slip_not_found",
+        "qrcode_not_found": "qrcode_not_found",
+        "invalid_image_format": "invalid_image_format",
+        "image_size_too_large": "image_size_too_large",
+        "slip_pending": "slip_pending",
+    }
+    code = alias.get(code, code)
+
+    reply_line(reply_token, [error_flex(code, detail)])
 
 
-@app.route("/", methods=["GET"])
+# =========================
+# Flask routes
+# =========================
+@app.get("/")
+def home():
+    return jsonify(
+        {
+            "ok": True,
+            "service": "LINE Slip Bot - เถ้าแก่น้อย",
+            "easyslip": "v2",
+        }
+    )
+
+
+@app.get("/health")
 def health():
-    return "LINE Slip Bot V2 is running! 🤖"
+    return "OK", 200
 
+
+@app.post("/webhook")
+def webhook():
+    raw_body = request.get_data()
+    signature = request.headers.get("X-Line-Signature", "")
+
+    if not verify_line_signature(raw_body, signature):
+        abort(400, description="Invalid LINE signature")
+
+    payload = request.get_json(silent=True) or {}
+    events = payload.get("events") or []
+
+    for event in events:
+        try:
+            if event.get("type") != "message":
+                continue
+
+            msg_type = ((event.get("message") or {}).get("type") or "").lower()
+
+            if msg_type == "text":
+                handle_text(event)
+            elif msg_type == "image":
+                handle_image(event)
+
+        except Exception as exc:
+            # Always keep webhook endpoint alive.
+            print("[WEBHOOK] event error:", exc)
+
+    return "OK", 200
+
+
+init_db()
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
+    port = int(os.getenv("PORT", "8080"))
     app.run(host="0.0.0.0", port=port)
