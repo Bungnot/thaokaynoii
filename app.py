@@ -1,4 +1,3 @@
-# === VERSION: BANK_LOGO_V2_20260810 ===
 import os
 import hmac
 import hashlib
@@ -8,7 +7,7 @@ import csv
 import threading
 import time
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 import requests
 from flask import Flask, request, abort, jsonify
@@ -17,6 +16,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 app = Flask(__name__)
+
+# เวลาไทยสำหรับกติกา “สลิปใช้ได้เฉพาะวันปัจจุบัน”
+# ประเทศไทยใช้ UTC+7 ตลอดปี (ไม่มี DST)
+THAI_TZ = timezone(timedelta(hours=7))
 
 # =========================
 # Environment variables
@@ -659,125 +662,66 @@ def normalize_easyslip_error(payload: dict):
     return code.lower(), message
 
 
+def parse_slip_datetime_th(value: str):
+    """แปลง rawSlip.date ของ EasySlip เป็น datetime เวลาไทย (UTC+7)"""
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+
+    # ถ้า API ส่ง datetime ที่ไม่มี timezone ให้ถือว่าเป็นเวลาไทย
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=THAI_TZ)
+
+    return dt.astimezone(THAI_TZ)
+
+
+def validate_slip_is_today(data: dict):
+    """
+    ตรวจว่าสลิปเป็น “วันนี้” ตามเวลาไทยหรือไม่
+    return: (is_valid, detail_message)
+    """
+    raw_slip = (data or {}).get("rawSlip") or {}
+    slip_date_raw = str(raw_slip.get("date") or "").strip()
+    slip_dt = parse_slip_datetime_th(slip_date_raw)
+
+    today_th = datetime.now(THAI_TZ).date()
+
+    if slip_dt is None:
+        return (
+            False,
+            "ไม่สามารถอ่านวันที่จากสลิปได้\n"
+            "ระบบรับเฉพาะสลิปที่โอนภายในวันนี้เท่านั้น",
+        )
+
+    if slip_dt.date() != today_th:
+        return (
+            False,
+            f"สลิปนี้เป็นวันที่ {slip_dt.strftime('%d/%m/%Y')}\n"
+            f"รับเฉพาะสลิปของวันนี้ {today_th.strftime('%d/%m/%Y')} เท่านั้น",
+        )
+
+    return True, ""
+
+
 def display_date(value: str) -> str:
     if not value:
         return "-"
 
-    try:
-        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    dt = parse_slip_datetime_th(value)
+    if dt is not None:
         return dt.strftime("%d/%m/%Y %H:%M")
-    except Exception:
-        return value
+
+    return value
 
 
 # =========================
 # Flex Message
 # =========================
-# Bank logos: https://github.com/casperstack/thai-banks-logo
-# ใช้ไฟล์ PNG จาก raw.githubusercontent.com โดยตรงใน LINE Flex
-_THAI_BANK_LOGO_SYMBOLS = {
-    "KBANK", "SCB", "KTB", "BBL", "BAY", "TTB", "UOB", "KKP",
-    "GSB", "BAAC", "CIMB", "CITI", "GHB", "HSBC", "IBANK", "ICBC",
-    "LHB", "TCRB", "TISCO", "PromptPay", "TrueMoney",
-}
-
-_BANK_LOGO_ALIASES = {
-    # ชื่อเก่าหรือรูปแบบที่ API บางตัวอาจส่งกลับมา
-    "TMB": "TTB",
-    "TBANK": "TTB",
-    "PROMPTPAY": "PromptPay",
-    "TRUE MONEY": "TrueMoney",
-    "TRUEMONEY": "TrueMoney",
-}
-
-
-def bank_logo_symbol(bank_short: str) -> str:
-    raw = str(bank_short or "").strip()
-    if not raw or raw == "-":
-        return ""
-
-    upper = raw.upper()
-    symbol = _BANK_LOGO_ALIASES.get(upper, upper)
-
-    # สัญลักษณ์ 2 ตัวนี้ใน repo ใช้ตัวพิมพ์เล็ก/ใหญ่เฉพาะแบบ
-    if symbol == "PROMPTPAY":
-        symbol = "PromptPay"
-    elif symbol == "TRUEMONEY":
-        symbol = "TrueMoney"
-
-    return symbol if symbol in _THAI_BANK_LOGO_SYMBOLS else ""
-
-
-def bank_logo_url(bank_short: str) -> str:
-    symbol = bank_logo_symbol(bank_short)
-    if not symbol:
-        return ""
-    return (
-        "https://raw.githubusercontent.com/"
-        f"casperstack/thai-banks-logo/master/icons/{symbol}.png"
-    )
-
-
-def bank_party_card(role_label: str, person_name: str, bank_short: str) -> dict:
-    """แถวผู้โอน/ผู้รับ พร้อมโลโก้ธนาคาร ถ้าพบรหัสที่รองรับ"""
-    logo_url = bank_logo_url(bank_short)
-
-    contents = []
-    if logo_url:
-        contents.append({
-            "type": "image",
-            "url": logo_url,
-            "size": "sm",
-            "aspectRatio": "1:1",
-            "aspectMode": "fit",
-            "flex": 0,
-        })
-
-    contents.append({
-        "type": "box",
-        "layout": "vertical",
-        "margin": "md" if logo_url else "none",
-        "flex": 1,
-        "contents": [
-            {
-                "type": "text",
-                "text": role_label,
-                "size": "xs",
-                "color": "#7A8C94",
-                "weight": "bold",
-            },
-            {
-                "type": "text",
-                "text": str(person_name or "-"),
-                "size": "sm",
-                "color": "#123F5A",
-                "weight": "bold",
-                "wrap": True,
-                "margin": "xs",
-            },
-            {
-                "type": "text",
-                "text": str(bank_short or "-"),
-                "size": "xs",
-                "color": "#66757F",
-                "wrap": True,
-                "margin": "xs",
-            },
-        ],
-    })
-
-    return {
-        "type": "box",
-        "layout": "horizontal",
-        "alignItems": "center",
-        "margin": "lg",
-        "paddingAll": "10px",
-        "backgroundColor": "#FFFFFF",
-        "cornerRadius": "12px",
-        "contents": contents,
-    }
-
-
 def flex_row(label: str, value: str, value_color="#123F5A"):
     return {
         "type": "box",
@@ -879,8 +823,10 @@ def success_flex(data: dict) -> dict:
                     "margin": "xl",
                     "color": "#D9E7DB",
                 },
-                bank_party_card("ผู้โอน", sender_name, sender_bank),
-                bank_party_card("ผู้รับ", receiver_name, receiver_bank),
+                flex_row("ผู้โอน", sender_name),
+                flex_row("ธนาคารผู้โอน", sender_bank),
+                flex_row("ผู้รับ", receiver_name),
+                flex_row("ธนาคารผู้รับ", receiver_bank),
                 flex_row("วันที่", date_text),
                 flex_row("เลขอ้างอิง", trans_ref[-18:] if len(trans_ref) > 18 else trans_ref),
                 {
@@ -937,6 +883,10 @@ def success_flex(data: dict) -> dict:
 
 
 ERROR_TEXTS = {
+    "slip_wrong_date": (
+        "สลิปไม่ใช่ของวันนี้",
+        "ระบบรับเฉพาะสลิปที่โอนภายในวันนี้เท่านั้น",
+    ),
     "duplicate_slip": (
         "สลิปนี้ถูกใช้แล้ว",
         "ไม่สามารถใช้สลิปซ้ำได้ กรุณาใช้สลิปใหม่เท่านั้น",
@@ -967,7 +917,7 @@ ERROR_TEXTS = {
     ),
     "slip_pending": (
         "สลิปกำลังรอตรวจสอบ",
-        "หากเป็นธนาคารกรุงเทพ กรุณารอสักครู่ 2-3 นาที แล้วลองใหม่",
+        "หากเป็นธนาคารกรุงเทพ กรุณารอสักครู่ 1-2 นาทีแล้วลองใหม่",
     ),
     "account_not_match": (
         "บัญชีผู้รับไม่ตรง",
@@ -999,10 +949,17 @@ def error_flex(code: str, detail: str = "") -> dict:
         ("ตรวจสอบสลิปไม่สำเร็จ", detail or "กรุณาลองใหม่อีกครั้ง"),
     )
 
-    # Dedicated copy for duplicate slips
+    # กรณีวันสลิปไม่ตรง ใช้รายละเอียดแบบไดนามิกเพื่อบอกทั้งวันสลิปและวันนี้
+    if normalized == "slip_wrong_date" and detail:
+        desc = detail
+
+    # Dedicated copy for duplicate / wrong-date slips
     if normalized == "duplicate_slip":
         badge = "!"
         header = "#E53935"
+    elif normalized == "slip_wrong_date":
+        badge = "!"
+        header = "#F59E0B"
     else:
         badge = "×"
         header = "#D64545"
@@ -2175,6 +2132,17 @@ def handle_image(event: dict):
     if result.get("success") is True:
         data = result.get("data") or {}
 
+        # ====== รับเฉพาะสลิปของ “วันนี้” ตามเวลาไทย ======
+        # ต้องเช็กก่อน isDuplicate / claim_trans_ref เพื่อให้สลิปคนละวัน
+        # ถูกแจ้งว่า “ไม่ใช่ของวันนี้” และไม่ถูกบันทึกว่าใช้งานแล้วในฐานข้อมูลบอท
+        is_today, date_detail = validate_slip_is_today(data)
+        if not is_today:
+            reply_line(
+                reply_token,
+                [error_flex("slip_wrong_date", date_detail)],
+            )
+            return
+
         # EasySlip can expose isDuplicate in success data.
         if data.get("isDuplicate") is True:
             reply_line(reply_token, [error_flex("duplicate_slip")])
@@ -2185,13 +2153,26 @@ def handle_image(event: dict):
             reply_line(reply_token, [error_flex("account_not_match")])
             return
 
-        # Optional second duplicate-protection layer using PostgreSQL.
+        # Optional second duplicate-protection layer using SQLite.
         if not claim_trans_ref(data):
             reply_line(reply_token, [error_flex("duplicate_slip")])
             return
 
         reply_line(reply_token, [success_flex(data)])
         return
+
+    # บาง error response ของ EasySlip อาจแนบ data/rawSlip กลับมาด้วย
+    # ถ้ามีวันที่สลิปและเป็นคนละวัน ให้กติกา “วันนี้เท่านั้น” มาก่อน error อื่น
+    error_data = result.get("data") or {}
+    if isinstance(error_data, dict) and ((error_data.get("rawSlip") or {}).get("date")):
+        is_today, date_detail = validate_slip_is_today(error_data)
+        if not is_today:
+            reply_line(
+                reply_token,
+                [error_flex("slip_wrong_date", date_detail)],
+            )
+            return
+
 
     code, detail = normalize_easyslip_error(result)
 
