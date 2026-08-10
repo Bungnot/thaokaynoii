@@ -1,3 +1,4 @@
+# === VERSION: BANK_LOGO_V2_20260810 ===
 import os
 import hmac
 import hashlib
@@ -672,6 +673,111 @@ def display_date(value: str) -> str:
 # =========================
 # Flex Message
 # =========================
+# Bank logos: https://github.com/casperstack/thai-banks-logo
+# ใช้ไฟล์ PNG จาก raw.githubusercontent.com โดยตรงใน LINE Flex
+_THAI_BANK_LOGO_SYMBOLS = {
+    "KBANK", "SCB", "KTB", "BBL", "BAY", "TTB", "UOB", "KKP",
+    "GSB", "BAAC", "CIMB", "CITI", "GHB", "HSBC", "IBANK", "ICBC",
+    "LHB", "TCRB", "TISCO", "PromptPay", "TrueMoney",
+}
+
+_BANK_LOGO_ALIASES = {
+    # ชื่อเก่าหรือรูปแบบที่ API บางตัวอาจส่งกลับมา
+    "TMB": "TTB",
+    "TBANK": "TTB",
+    "PROMPTPAY": "PromptPay",
+    "TRUE MONEY": "TrueMoney",
+    "TRUEMONEY": "TrueMoney",
+}
+
+
+def bank_logo_symbol(bank_short: str) -> str:
+    raw = str(bank_short or "").strip()
+    if not raw or raw == "-":
+        return ""
+
+    upper = raw.upper()
+    symbol = _BANK_LOGO_ALIASES.get(upper, upper)
+
+    # สัญลักษณ์ 2 ตัวนี้ใน repo ใช้ตัวพิมพ์เล็ก/ใหญ่เฉพาะแบบ
+    if symbol == "PROMPTPAY":
+        symbol = "PromptPay"
+    elif symbol == "TRUEMONEY":
+        symbol = "TrueMoney"
+
+    return symbol if symbol in _THAI_BANK_LOGO_SYMBOLS else ""
+
+
+def bank_logo_url(bank_short: str) -> str:
+    symbol = bank_logo_symbol(bank_short)
+    if not symbol:
+        return ""
+    return (
+        "https://raw.githubusercontent.com/"
+        f"casperstack/thai-banks-logo/master/icons/{symbol}.png"
+    )
+
+
+def bank_party_card(role_label: str, person_name: str, bank_short: str) -> dict:
+    """แถวผู้โอน/ผู้รับ พร้อมโลโก้ธนาคาร ถ้าพบรหัสที่รองรับ"""
+    logo_url = bank_logo_url(bank_short)
+
+    contents = []
+    if logo_url:
+        contents.append({
+            "type": "image",
+            "url": logo_url,
+            "size": "sm",
+            "aspectRatio": "1:1",
+            "aspectMode": "fit",
+            "flex": 0,
+        })
+
+    contents.append({
+        "type": "box",
+        "layout": "vertical",
+        "margin": "md" if logo_url else "none",
+        "flex": 1,
+        "contents": [
+            {
+                "type": "text",
+                "text": role_label,
+                "size": "xs",
+                "color": "#7A8C94",
+                "weight": "bold",
+            },
+            {
+                "type": "text",
+                "text": str(person_name or "-"),
+                "size": "sm",
+                "color": "#123F5A",
+                "weight": "bold",
+                "wrap": True,
+                "margin": "xs",
+            },
+            {
+                "type": "text",
+                "text": str(bank_short or "-"),
+                "size": "xs",
+                "color": "#66757F",
+                "wrap": True,
+                "margin": "xs",
+            },
+        ],
+    })
+
+    return {
+        "type": "box",
+        "layout": "horizontal",
+        "alignItems": "center",
+        "margin": "lg",
+        "paddingAll": "10px",
+        "backgroundColor": "#FFFFFF",
+        "cornerRadius": "12px",
+        "contents": contents,
+    }
+
+
 def flex_row(label: str, value: str, value_color="#123F5A"):
     return {
         "type": "box",
@@ -773,10 +879,8 @@ def success_flex(data: dict) -> dict:
                     "margin": "xl",
                     "color": "#D9E7DB",
                 },
-                flex_row("ผู้โอน", sender_name),
-                flex_row("ธนาคารผู้โอน", sender_bank),
-                flex_row("ผู้รับ", receiver_name),
-                flex_row("ธนาคารผู้รับ", receiver_bank),
+                bank_party_card("ผู้โอน", sender_name, sender_bank),
+                bank_party_card("ผู้รับ", receiver_name, receiver_bank),
                 flex_row("วันที่", date_text),
                 flex_row("เลขอ้างอิง", trans_ref[-18:] if len(trans_ref) > 18 else trans_ref),
                 {
@@ -2168,4 +2272,3 @@ init_db()
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8080"))
     app.run(host="0.0.0.0", port=port)
- 
