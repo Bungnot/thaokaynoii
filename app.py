@@ -84,7 +84,7 @@ ADMIN_UIDS = (
 PEH_LIST = {}   # dict[source_key] = ["ข้อความ..."]
 TARGET_GROUP_NAME = os.getenv(
     "TARGET_GROUP_NAME",
-    "🚀บั้งไฟน้อย 10% • เถ้าแก่น้อย •"
+    "🚀บั้งไฟน้อย • เถ้าแก่น้อย •"
 ).strip()
 
 
