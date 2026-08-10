@@ -722,83 +722,16 @@ def display_date(value: str) -> str:
 # =========================
 # Flex Message
 # =========================
-
-# โลโก้ธนาคารจาก:
-# https://github.com/casperstack/thai-banks-logo
-#
-# ใช้ raw.githubusercontent.com เพื่อให้ LINE Flex Message โหลดรูปได้โดยตรง
-BANK_LOGO_URLS = {
-    "KBANK": "https://raw.githubusercontent.com/casperstack/thai-banks-logo/master/icons/KBANK.png",
-    "SCB": "https://raw.githubusercontent.com/casperstack/thai-banks-logo/master/icons/SCB.png",
-    "KTB": "https://raw.githubusercontent.com/casperstack/thai-banks-logo/master/icons/KTB.png",
-    "BBL": "https://raw.githubusercontent.com/casperstack/thai-banks-logo/master/icons/BBL.png",
-    "BAY": "https://raw.githubusercontent.com/casperstack/thai-banks-logo/master/icons/BAY.png",
-    "TTB": "https://raw.githubusercontent.com/casperstack/thai-banks-logo/master/icons/TTB.png",
-    "UOB": "https://raw.githubusercontent.com/casperstack/thai-banks-logo/master/icons/UOB.png",
-    "KKP": "https://raw.githubusercontent.com/casperstack/thai-banks-logo/master/icons/KKP.png",
-    "GSB": "https://raw.githubusercontent.com/casperstack/thai-banks-logo/master/icons/GSB.png",
-    "BAAC": "https://raw.githubusercontent.com/casperstack/thai-banks-logo/master/icons/BAAC.png",
-    "CIMB": "https://raw.githubusercontent.com/casperstack/thai-banks-logo/master/icons/CIMB.png",
-    "CITI": "https://raw.githubusercontent.com/casperstack/thai-banks-logo/master/icons/CITI.png",
-    "GHB": "https://raw.githubusercontent.com/casperstack/thai-banks-logo/master/icons/GHB.png",
-    "HSBC": "https://raw.githubusercontent.com/casperstack/thai-banks-logo/master/icons/HSBC.png",
-    "IBANK": "https://raw.githubusercontent.com/casperstack/thai-banks-logo/master/icons/IBANK.png",
-    "ICBC": "https://raw.githubusercontent.com/casperstack/thai-banks-logo/master/icons/ICBC.png",
-    "LHB": "https://raw.githubusercontent.com/casperstack/thai-banks-logo/master/icons/LHB.png",
-    "TCRB": "https://raw.githubusercontent.com/casperstack/thai-banks-logo/master/icons/TCRB.png",
-    "TISCO": "https://raw.githubusercontent.com/casperstack/thai-banks-logo/master/icons/TISCO.png",
-    "PROMPTPAY": "https://raw.githubusercontent.com/casperstack/thai-banks-logo/master/icons/PromptPay.png",
-    "TRUEMONEY": "https://raw.githubusercontent.com/casperstack/thai-banks-logo/master/icons/TrueMoney.png",
-}
-
-# alias เผื่อ API ส่งรหัสเก่า/ชื่อที่ต่างจาก repo
-BANK_CODE_ALIASES = {
-    "TMB": "TTB",
-    "TMBTHANACHART": "TTB",
-    "KRUNGSRI": "BAY",
-    "KRUNGTHAI": "KTB",
-    "KASIKORN": "KBANK",
-    "SIAMCOMMERCIALBANK": "SCB",
-    "PROMPT PAY": "PROMPTPAY",
-    "TRUE MONEY": "TRUEMONEY",
-}
-
-
-def normalize_bank_code(bank_code: str) -> str:
-    code = str(bank_code or "").strip().upper()
-    if not code:
-        return ""
-
-    # ตัดอักขระคั่นบางชนิด เพื่อช่วย match รหัสจาก API
-    compact = re.sub(r"[^A-Z0-9]", "", code)
-
-    if code in BANK_CODE_ALIASES:
-        return BANK_CODE_ALIASES[code]
-    if compact in BANK_CODE_ALIASES:
-        return BANK_CODE_ALIASES[compact]
-    if compact in BANK_LOGO_URLS:
-        return compact
-
-    return code
-
-
-def bank_logo_url(bank_code: str) -> str:
-    normalized = normalize_bank_code(bank_code)
-    return BANK_LOGO_URLS.get(normalized, "")
-
-
 def flex_row(label: str, value: str, value_color="#123F5A"):
-    """แถวข้อมูลแบบกะทัดรัดสำหรับหน้าจอมือถือ"""
     return {
         "type": "box",
         "layout": "horizontal",
-        "margin": "sm",
-        "alignItems": "center",
+        "margin": "md",
         "contents": [
             {
                 "type": "text",
                 "text": label,
-                "size": "xs",
+                "size": "sm",
                 "color": "#6B7C85",
                 "flex": 4,
                 "wrap": True,
@@ -806,73 +739,12 @@ def flex_row(label: str, value: str, value_color="#123F5A"):
             {
                 "type": "text",
                 "text": str(value),
-                "size": "xs",
+                "size": "sm",
                 "color": value_color,
                 "weight": "bold",
                 "align": "end",
-                "gravity": "center",
-                "flex": 7,
+                "flex": 6,
                 "wrap": True,
-            },
-        ],
-    }
-
-
-def flex_bank_row(label: str, bank_code: str, value_color="#123F5A"):
-    """
-    แถวธนาคารพร้อมโลโก้
-    - ถ้าพบรหัสธนาคารใน BANK_LOGO_URLS จะแสดงโลโก้
-    - ถ้าไม่พบ จะยังแสดงชื่อ/รหัสธนาคารตามปกติ
-    """
-    display_code = str(bank_code or "-").strip() or "-"
-    logo = bank_logo_url(display_code)
-
-    right_contents = []
-
-    if logo:
-        right_contents.append({
-            "type": "image",
-            "url": logo,
-            "size": "20px",
-            "aspectRatio": "1:1",
-            "aspectMode": "fit",
-            "flex": 0,
-        })
-
-    right_contents.append({
-        "type": "text",
-        "text": display_code,
-        "size": "xs",
-        "color": value_color,
-        "weight": "bold",
-        "align": "end",
-        "gravity": "center",
-        "margin": "sm" if logo else "none",
-        "flex": 0,
-        "wrap": False,
-    })
-
-    return {
-        "type": "box",
-        "layout": "horizontal",
-        "margin": "sm",
-        "alignItems": "center",
-        "contents": [
-            {
-                "type": "text",
-                "text": label,
-                "size": "xs",
-                "color": "#6B7C85",
-                "flex": 4,
-                "wrap": True,
-            },
-            {
-                "type": "box",
-                "layout": "horizontal",
-                "alignItems": "center",
-                "justifyContent": "flex-end",
-                "flex": 7,
-                "contents": right_contents,
             },
         ],
     }
@@ -891,28 +763,23 @@ def success_flex(data: dict) -> dict:
     trans_ref = str(raw.get("transRef") or "-")
     date_text = display_date(str(raw.get("date") or ""))
 
-    # ใช้ kilo แทน giga เพื่อให้พอดีกับจอโทรศัพท์มากขึ้น
     bubble = {
         "type": "bubble",
-        "size": "kilo",
+        "size": "giga",
         "header": {
             "type": "box",
             "layout": "vertical",
             "backgroundColor": "#06C755",
-            "paddingStart": "14px",
-            "paddingEnd": "14px",
-            "paddingTop": "12px",
-            "paddingBottom": "12px",
+            "paddingAll": "20px",
             "contents": [
                 {
                     "type": "box",
                     "layout": "horizontal",
-                    "alignItems": "center",
                     "contents": [
                         {
                             "type": "text",
                             "text": "✓",
-                            "size": "2xl",
+                            "size": "3xl",
                             "weight": "bold",
                             "color": "#FFFFFF",
                             "flex": 0,
@@ -920,11 +787,11 @@ def success_flex(data: dict) -> dict:
                         {
                             "type": "text",
                             "text": "สลิปถูกต้อง",
-                            "size": "lg",
+                            "size": "xl",
                             "weight": "bold",
                             "color": "#FFFFFF",
                             "gravity": "center",
-                            "margin": "sm",
+                            "margin": "md",
                             "flex": 1,
                         },
                     ],
@@ -935,59 +802,47 @@ def success_flex(data: dict) -> dict:
             "type": "box",
             "layout": "vertical",
             "backgroundColor": "#F5FBF5",
-            "paddingStart": "14px",
-            "paddingEnd": "14px",
-            "paddingTop": "13px",
-            "paddingBottom": "12px",
+            "paddingAll": "22px",
             "contents": [
                 {
                     "type": "text",
                     "text": f"฿{amount:,.2f}",
-                    "size": "2xl",
+                    "size": "3xl",
                     "weight": "bold",
                     "color": "#0B4A6B",
                 },
                 {
                     "type": "text",
                     "text": "ตรวจสอบกับ EasySlip API V2 สำเร็จ",
-                    "size": "xs",
+                    "size": "sm",
                     "color": "#7A8C94",
-                    "margin": "xs",
+                    "margin": "sm",
                 },
                 {
                     "type": "separator",
-                    "margin": "lg",
+                    "margin": "xl",
                     "color": "#D9E7DB",
                 },
-
-                # ผู้โอน + โลโก้ธนาคารผู้โอน
                 flex_row("ผู้โอน", sender_name),
-                flex_bank_row("ธนาคารผู้โอน", sender_bank),
-
-                # ผู้รับ + โลโก้ธนาคารผู้รับ
+                flex_row("ธนาคารผู้โอน", sender_bank),
                 flex_row("ผู้รับ", receiver_name),
-                flex_bank_row("ธนาคารผู้รับ", receiver_bank),
-
+                flex_row("ธนาคารผู้รับ", receiver_bank),
                 flex_row("วันที่", date_text),
-                flex_row(
-                    "เลขอ้างอิง",
-                    trans_ref[-18:] if len(trans_ref) > 18 else trans_ref
-                ),
+                flex_row("เลขอ้างอิง", trans_ref[-18:] if len(trans_ref) > 18 else trans_ref),
                 {
                     "type": "separator",
-                    "margin": "lg",
+                    "margin": "xl",
                     "color": "#D9E7DB",
                 },
                 {
                     "type": "box",
                     "layout": "horizontal",
-                    "margin": "md",
-                    "alignItems": "center",
+                    "margin": "lg",
                     "contents": [
                         {
                             "type": "text",
                             "text": "✓",
-                            "size": "lg",
+                            "size": "xl",
                             "weight": "bold",
                             "color": "#2B78B8",
                             "flex": 0,
@@ -995,21 +850,20 @@ def success_flex(data: dict) -> dict:
                         {
                             "type": "box",
                             "layout": "vertical",
-                            "margin": "sm",
-                            "flex": 1,
+                            "margin": "md",
                             "contents": [
                                 {
                                     "type": "text",
                                     "text": "สลิปจริงตรวจสอบโดย เถ้าแก่น้อย",
                                     "weight": "bold",
-                                    "size": "xs",
+                                    "size": "sm",
                                     "color": "#1A5276",
                                     "wrap": True,
                                 },
                                 {
                                     "type": "text",
                                     "text": "ไม่สามารถใช้สลิปซ้ำได้",
-                                    "size": "xxs",
+                                    "size": "xs",
                                     "color": "#66757F",
                                     "margin": "xs",
                                 },
