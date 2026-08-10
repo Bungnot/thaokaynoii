@@ -5,6 +5,7 @@ import base64
 import re
 import csv
 import threading
+import time
 import sqlite3
 from datetime import datetime
 
@@ -37,6 +38,13 @@ VERIFY_MATCH_ACCOUNT = os.getenv("VERIFY_MATCH_ACCOUNT", "true").lower() == "tru
 
 # Maximum image size supported by EasySlip V2 = 4 MB
 MAX_IMAGE_BYTES = 4 * 1024 * 1024
+
+# กันลูกค้าส่งหลายรูปติดกันในแชท 1-1 แล้วกินโควต้า EasySlip หลายครั้ง
+# จะตรวจเฉพาะรูปแรกในช่วงเวลานี้ รูปถัดไปจะเงียบและไม่เรียก EasySlip
+try:
+    PRIVATE_IMAGE_BURST_SECONDS = max(1.0, float(os.getenv("PRIVATE_IMAGE_BURST_SECONDS", "10")))
+except (TypeError, ValueError):
+    PRIVATE_IMAGE_BURST_SECONDS = 10.0
 
 # Railway Volume + SQLite
 # Railway จะสร้าง RAILWAY_VOLUME_MOUNT_PATH ให้อัตโนมัติเมื่อ Volume ถูก mount กับ service
@@ -91,6 +99,43 @@ _USERS_LOCK = threading.Lock()
 # Railway Volume + SQLite
 # =========================
 _DB_LOCK = threading.RLock()
+
+# กัน image burst ต่อผู้ใช้ในแชท 1-1
+_PRIVATE_IMAGE_BURST_LOCK = threading.Lock()
+_PRIVATE_IMAGE_LAST_ACCEPTED = {}  # dict[user_id] = monotonic timestamp
+
+
+def _claim_private_image_slot(user_id: str) -> bool:
+    """
+    True  = รูปแรกของชุด ส่งเข้าตรวจได้
+    False = รูปถัดไปที่ส่งติดกัน ให้เงียบและไม่เรียก EasySlip
+    """
+    uid = str(user_id or "").strip()
+    if not uid:
+        # source type=user ปกติควรมี userId; ถ้าไม่มีให้เงียบเพื่อไม่เสี่ยงเสียโควต้า
+        return False
+
+    now = time.monotonic()
+
+    with _PRIVATE_IMAGE_BURST_LOCK:
+        last = _PRIVATE_IMAGE_LAST_ACCEPTED.get(uid)
+        if last is not None and (now - last) < PRIVATE_IMAGE_BURST_SECONDS:
+            return False
+
+        _PRIVATE_IMAGE_LAST_ACCEPTED[uid] = now
+
+        # ป้องกัน dict โตค้างนาน หากมีผู้ใช้จำนวนมาก
+        if len(_PRIVATE_IMAGE_LAST_ACCEPTED) > 5000:
+            stale_before = now - max(60.0, PRIVATE_IMAGE_BURST_SECONDS * 10)
+            stale_uids = [
+                saved_uid
+                for saved_uid, ts in _PRIVATE_IMAGE_LAST_ACCEPTED.items()
+                if ts < stale_before
+            ]
+            for saved_uid in stale_uids:
+                _PRIVATE_IMAGE_LAST_ACCEPTED.pop(saved_uid, None)
+
+    return True
 
 
 def get_db():
@@ -337,6 +382,52 @@ def add_admin_persistent(uid: str, display_name: str, added_by: str):
             conn.rollback()
         print("[DB] add admin error:", exc)
         return False, False, str(exc)
+    finally:
+        if conn:
+            conn.close()
+
+
+def list_admins_persistent():
+    """คืนรายชื่อแอดมินถาวรจาก SQLite พร้อมชื่อที่บอทเคยเก็บไว้"""
+    conn = None
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT
+                a.uid AS uid,
+                COALESCE(
+                    NULLIF(a.display_name, ''),
+                    NULLIF(u.display_name, ''),
+                    ''
+                ) AS display_name,
+                a.added_by AS added_by,
+                a.created_at AS created_at
+            FROM bot_admins AS a
+            LEFT JOIN line_users AS u ON u.uid = a.uid
+            ORDER BY a.created_at ASC, a.uid ASC
+            """
+        )
+        rows = cur.fetchall()
+        cur.close()
+        return [
+            {
+                "uid": str(row["uid"] or ""),
+                "display_name": str(row["display_name"] or ""),
+                "added_by": str(row["added_by"] or ""),
+                "created_at": str(row["created_at"] or ""),
+            }
+            for row in rows
+            if str(row["uid"] or "").strip()
+        ]
+    except Exception as exc:
+        print("[DB] list admins error:", exc)
+        # fallback ให้คำสั่งยังใช้ได้ แม้ DB อ่านพลาดชั่วคราว
+        return [
+            {"uid": uid, "display_name": "", "added_by": "", "created_at": ""}
+            for uid in sorted(ADMIN_UIDS)
+        ]
     finally:
         if conn:
             conn.close()
@@ -1705,6 +1796,45 @@ def handle_text(event: dict):
 
 
 
+    # ====== คำสั่ง "เช็คแอดมิน" ======
+    # ใช้ได้เฉพาะแอดมิน เพื่อดูรายชื่อแอดมินที่เก็บถาวรใน SQLite
+    if text in {"เช็คแอดมิน", "เช็กแอดมิน", "เชคแอดมิน"}:
+        if not is_admin:
+            reply_line(
+                reply_token,
+                [text_message("⛔ คำสั่งเช็คแอดมิน ใช้ได้เฉพาะแอดมินเท่านั้น")]
+            )
+            return
+
+        admins = list_admins_persistent()
+
+        if not admins:
+            reply_line(reply_token, [text_message("ยังไม่มีรายชื่อแอดมินในระบบ")])
+            return
+
+        lines = [f"👑 แอดมินทั้งหมด {len(admins)} คน"]
+        for index, admin in enumerate(admins, start=1):
+            name = admin.get("display_name") or "ไม่ทราบชื่อ"
+            uid = admin.get("uid") or "-"
+            lines.append(f"{index}. 👤 {name}\n   🆔 {uid}")
+
+        # LINE จำกัดจำนวนข้อความต่อ reply; แบ่งเป็นก้อนเพื่อกันข้อความยาวเกินไป
+        chunks = []
+        current = ""
+        for line in lines:
+            candidate = f"{current}\n{line}".strip()
+            if len(candidate) > 4500 and current:
+                chunks.append(current)
+                current = line
+            else:
+                current = candidate
+        if current:
+            chunks.append(current)
+
+        reply_line(reply_token, [text_message(chunk) for chunk in chunks[:5]])
+        return
+
+
     # ====== คำสั่ง "เพิ่มแอด @ชื่อไลน์" ======
     # ใช้ได้เฉพาะแอดมินปัจจุบัน
     if re.match(r"^เพิ่มแอด(?:\s+|$)", text, re.IGNORECASE):
@@ -1889,6 +2019,17 @@ def handle_image(event: dict):
 
     if source_type != "user":
         print(f"[SLIP] ignore image from source_type={source_type}")
+        return
+
+    user_id = str(source.get("userId") or "").strip()
+
+    # ถ้าลูกค้าส่งหลายภาพติดกันในแชท 1-1:
+    # ตรวจเฉพาะภาพแรก ภาพถัดไปเงียบ และไม่ดาวน์โหลด/ไม่เรียก EasySlip
+    if not _claim_private_image_slot(user_id):
+        print(
+            f"[SLIP] ignore burst image user={user_id[:10]}... "
+            f"window={PRIVATE_IMAGE_BURST_SECONDS:g}s"
+        )
         return
 
     reply_token = event.get("replyToken")
