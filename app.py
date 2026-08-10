@@ -1350,7 +1350,8 @@ def _peh_split_row(display_text: str, symbol: str | None):
     if m:
         left = m.group(1).strip()
         amount = m.group(2).strip()
-        right = f"{amount} {emoji_text}".strip()
+        # ติดเลขกับ emoji ไม่มีช่องว่าง เพื่อกัน LINE ตัดบรรทัดระหว่างกัน
+        right = f"{amount}{emoji_text}" if emoji_text else amount
         return left, right
 
     return clean, emoji_text
@@ -1436,7 +1437,7 @@ def _peh_row(number: int, display_text: str, symbol: str | None) -> dict:
                 "color": "#24313A",
                 "wrap": True,
                 "gravity": "center",
-                "flex": 6,
+                "flex": 5,
             },
             {
                 "type": "text",
@@ -1446,8 +1447,9 @@ def _peh_row(number: int, display_text: str, symbol: str | None) -> dict:
                 "color": "#24313A",
                 "align": "end",
                 "gravity": "center",
-                "flex": 3,
+                "flex": 4,
                 "wrap": False,
+                "adjustMode": "shrink-to-fit",
             },
         ],
     }
