@@ -148,6 +148,16 @@ def init_db():
 
         cur.execute(
             """
+            CREATE TABLE IF NOT EXISTS verified_image_hashes (
+                image_hash TEXT PRIMARY KEY,
+                trans_ref TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+
+        cur.execute(
+            """
             CREATE TABLE IF NOT EXISTS line_users (
                 uid TEXT PRIMARY KEY,
                 display_name TEXT NOT NULL DEFAULT '',
@@ -473,10 +483,14 @@ def claim_trans_ref(data: dict) -> bool:
 # =========================
 # Quota Saver: อ่าน QR ในเครื่องก่อนยิง EasySlip
 # =========================
-def extract_qr_payload_local(image_bytes: bytes) -> str:
+def extract_qr_payload_local(image_bytes: bytes):
     """
-    อ่าน QR จากรูปด้วย OpenCV ภายใน Railway
-    import ตอนใช้งานจริงเท่านั้น เพื่อไม่ให้ startup/healthcheck ช้า
+    อ่าน QR ในเครื่องแบบหลายรอบ
+    return: (payload: str, has_qr: bool)
+
+    - payload != ""  : อ่าน QR สำเร็จ ใช้ EasySlip Payload API ได้
+    - has_qr = True  : เห็น QR แต่ decode ไม่สำเร็จ ให้ fallback อัปโหลดรูปไป EasySlip
+    - has_qr = False : ไม่พบ QR -> ถือว่าไม่ใช่สลิปและเงียบ
     """
     try:
         import cv2
@@ -486,52 +500,165 @@ def extract_qr_payload_local(image_bytes: bytes) -> str:
         image = cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
         if image is None:
-            return ""
+            return "", False
 
         detector = cv2.QRCodeDetector()
+        h, w = image.shape[:2]
 
-        # ลองอ่าน QR เดี่ยวก่อน
-        data, points, _ = detector.detectAndDecode(image)
-        if data:
-            return str(data).strip()
+        # เตรียม crop หลายแบบ เพราะ QR ในสลิปมักอยู่ล่าง/ขวา
+        regions = [image]
 
-        # ลองหลาย QR ถ้ารูปมีมากกว่า 1 จุด
-        try:
-            ok, decoded_info, points, _ = detector.detectAndDecodeMulti(image)
-            if ok and decoded_info:
-                for value in decoded_info:
-                    value = str(value or "").strip()
-                    if value:
-                        return value
-        except Exception:
-            pass
+        # ส่วนใหญ่ของภาพ
+        regions.extend([
+            image[h // 3:, :],
+            image[:, w // 3:],
+            image[h // 3:, w // 3:],
+            image[h // 2:, :],
+            image[:, w // 2:],
+            image[h // 2:, w // 2:],
+        ])
 
-        # ลองขยายภาพเพื่อช่วยกรณี QR เล็ก
-        try:
-            enlarged = cv2.resize(
-                image,
-                None,
-                fx=1.8,
-                fy=1.8,
-                interpolation=cv2.INTER_CUBIC
-            )
-            data, points, _ = detector.detectAndDecode(enlarged)
-            if data:
-                return str(data).strip()
-        except Exception:
-            pass
+        # overlapping 3x3 windows ขนาด ~60% ของภาพ
+        crop_w = max(1, int(w * 0.60))
+        crop_h = max(1, int(h * 0.60))
 
-        return ""
+        xs = [0, max(0, (w - crop_w) // 2), max(0, w - crop_w)]
+        ys = [0, max(0, (h - crop_h) // 2), max(0, h - crop_h)]
+
+        for y in ys:
+            for x in xs:
+                regions.append(
+                    image[y:y + crop_h, x:x + crop_w]
+                )
+
+        has_qr = False
+
+        # ลองหลาย scale เพื่อช่วย QR ขนาดเล็ก
+        scales = (1.0, 1.5, 2.0)
+
+        for region in regions:
+            if region is None or region.size == 0:
+                continue
+
+            for scale in scales:
+                if scale == 1.0:
+                    test_img = region
+                else:
+                    test_img = cv2.resize(
+                        region,
+                        None,
+                        fx=scale,
+                        fy=scale,
+                        interpolation=cv2.INTER_CUBIC,
+                    )
+
+                # 1) decode เดี่ยว
+                try:
+                    data, points, _ = detector.detectAndDecode(test_img)
+                    if points is not None:
+                        has_qr = True
+                    if data:
+                        return str(data).strip(), True
+                except Exception:
+                    pass
+
+                # 2) detect-only: แม้ decode ไม่ได้ แต่ยืนยันว่ามี QR
+                try:
+                    detected, points = detector.detect(test_img)
+                    if detected and points is not None:
+                        has_qr = True
+                except Exception:
+                    pass
+
+                # 3) multi QR
+                try:
+                    ok, decoded_info, points, _ = detector.detectAndDecodeMulti(test_img)
+                    if points is not None:
+                        has_qr = True
+                    if ok and decoded_info:
+                        for value in decoded_info:
+                            value = str(value or "").strip()
+                            if value:
+                                return value, True
+                except Exception:
+                    pass
+
+        return "", has_qr
 
     except Exception as exc:
         print("[QR] local decode error:", exc)
-        return ""
+        return "", False
+
 
 
 def _payload_hash(payload: str) -> str:
     return hashlib.sha256(
         str(payload or "").encode("utf-8")
     ).hexdigest()
+
+
+
+def _image_hash(image_bytes: bytes) -> str:
+    return hashlib.sha256(image_bytes).hexdigest()
+
+
+def local_image_already_verified(image_bytes: bytes) -> bool:
+    if not image_bytes:
+        return False
+
+    conn = None
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT 1
+            FROM verified_image_hashes
+            WHERE image_hash = ?
+            LIMIT 1
+            """,
+            (_image_hash(image_bytes),),
+        )
+        found = cur.fetchone() is not None
+        cur.close()
+        return found
+    except Exception as exc:
+        print("[IMG] local cache lookup error:", exc)
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+
+def remember_verified_image(image_bytes: bytes, data: dict):
+    if not image_bytes:
+        return
+
+    raw = data.get("rawSlip") or {}
+    trans_ref = str(raw.get("transRef") or "").strip()
+
+    conn = None
+    try:
+        with _DB_LOCK:
+            conn = get_db()
+            cur = conn.cursor()
+            cur.execute(
+                """
+                INSERT OR REPLACE INTO verified_image_hashes
+                    (image_hash, trans_ref, created_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                """,
+                (_image_hash(image_bytes), trans_ref),
+            )
+            conn.commit()
+            cur.close()
+    except Exception as exc:
+        print("[IMG] remember cache error:", exc)
+        if conn:
+            conn.rollback()
+    finally:
+        if conn:
+            conn.close()
 
 
 def local_qr_already_verified(payload: str) -> bool:
@@ -716,6 +843,49 @@ def verify_payload_with_easyslip(qr_payload: str) -> dict:
         EASYSLIP_VERIFY_URL,
         headers=headers,
         json=body,
+        timeout=30,
+    )
+
+    try:
+        payload = resp.json()
+    except ValueError:
+        payload = {
+            "success": False,
+            "error": {
+                "code": "EASYSLIP_INVALID_RESPONSE",
+                "message": resp.text[:500] or "EasySlip response is not JSON",
+            },
+        }
+
+    payload["_http_status"] = resp.status_code
+    return payload
+
+
+
+def verify_image_with_easyslip(image_bytes: bytes) -> dict:
+    """
+    EasySlip API V2 แบบอัปโหลดรูป
+    ใช้เฉพาะกรณี OpenCV มองเห็น QR แต่ decode payload ไม่สำเร็จ
+    """
+    headers = {
+        "Authorization": f"Bearer {EASYSLIP_API_KEY}",
+    }
+
+    files = {
+        "image": ("slip.jpg", image_bytes, "image/jpeg"),
+    }
+
+    form = {
+        "checkDuplicate": "true",
+        "matchAccount": "true" if VERIFY_MATCH_ACCOUNT else "false",
+        "remark": "LINE BOT เถ้าแก่น้อย",
+    }
+
+    resp = requests.post(
+        EASYSLIP_VERIFY_URL,
+        headers=headers,
+        files=files,
+        data=form,
         timeout=30,
     )
 
@@ -2121,11 +2291,11 @@ def handle_text(event: dict):
 
 
 def handle_image(event: dict):
-    # ====== ตรวจสลิปเฉพาะแชท 1-1 เท่านั้น ======
-    # group / room = เงียบ และไม่เสีย EasySlip quota
+    # ตรวจสลิปเฉพาะแชท 1-1
     source = event.get("source") or {}
     source_type = str(source.get("type") or "").lower()
 
+    # รูปในกลุ่ม/room = เงียบ
     if source_type != "user":
         print(f"[SLIP] ignore image from source_type={source_type}")
         return
@@ -2141,63 +2311,75 @@ def handle_image(event: dict):
         )
         return
 
-    # 1) ดาวน์โหลดจาก LINE ก่อน — ขั้นตอนนี้ไม่ใช้ EasySlip quota
+    # ดาวน์โหลดรูปจาก LINE
     try:
         image_bytes = download_line_image(message_id)
     except Exception as exc:
         print("[LINE] image download error:", exc)
-        reply_line(
-            reply_token,
-            [error_flex("image_download_error", "ดาวน์โหลดรูปจาก LINE ไม่สำเร็จ")],
-        )
         return
 
+    if not image_bytes:
+        return
+
+    # รูปใหญ่เกิน = เงียบ ไม่ยิง API
     if len(image_bytes) > MAX_IMAGE_BYTES:
-        reply_line(reply_token, [error_flex("image_size_too_large")])
+        print("[SLIP] ignore image too large")
         return
 
-    # 2) อ่าน QR ภายใน Railway ก่อน
-    #    ถ้าไม่เจอ QR จะไม่เรียก EasySlip เลย
-    qr_payload = extract_qr_payload_local(image_bytes)
+    # กันรูปเดิมที่เคยตรวจผ่าน โดยไม่เสีย EasySlip quota
+    if local_image_already_verified(image_bytes):
+        reply_line(reply_token, [error_flex("duplicate_slip")])
+        return
 
-    if not qr_payload:
-        # ไม่พบ QR = ถือว่าไม่ใช่สลิป
-        # เงียบ ไม่ตอบลูกค้า และไม่เรียก EasySlip จึงไม่เสีย quota
+    # อ่าน/ตรวจหา QR ในเครื่องก่อน
+    qr_payload, has_qr = extract_qr_payload_local(image_bytes)
+
+    # ไม่มี QR จริง ๆ = ไม่ใช่สลิป -> เงียบ
+    if not has_qr:
         print("[SLIP] ignore image without QR code")
         return
 
-    # 3) เช็ก QR เดิมจาก SQLite บน Volume ก่อน
-    #    ถ้าเคยตรวจแล้ว ไม่เรียก EasySlip ซ้ำ
-    if local_qr_already_verified(qr_payload):
-        reply_line(
-            reply_token,
-            [error_flex("duplicate_slip")]
-        )
+    # ถ้า decode payload ได้ เช็ก cache payload ก่อน
+    if qr_payload and local_qr_already_verified(qr_payload):
+        reply_line(reply_token, [error_flex("duplicate_slip")])
         return
 
-    # 4) ถึงตรงนี้เท่านั้นจึงยิง EasySlip V2
+    # มี QR แล้วเท่านั้น จึงเรียก EasySlip
     try:
-        result = verify_payload_with_easyslip(qr_payload)
+        if qr_payload:
+            print("[SLIP] verify by QR payload")
+            result = verify_payload_with_easyslip(qr_payload)
+        else:
+            # เห็น QR แต่ OpenCV อ่านตัว payload ไม่ออก
+            # fallback ส่งรูปให้ EasySlip V2 อ่าน
+            print("[SLIP] QR detected but decode failed -> verify by image")
+            result = verify_image_with_easyslip(image_bytes)
+
     except requests.RequestException as exc:
         print("[EasySlip] request error:", exc)
         reply_line(
             reply_token,
-            [
-                error_flex(
-                    "easyslip_unavailable",
-                    "เชื่อมต่อ EasySlip ไม่สำเร็จ กรุณาลองใหม่"
-                )
-            ],
+            [error_flex(
+                "easyslip_unavailable",
+                "เชื่อมต่อ EasySlip ไม่สำเร็จ กรุณาลองใหม่"
+            )],
         )
         return
 
-    # 5) EasySlip V2 success
     if result.get("success") is True:
         data = result.get("data") or {}
+        raw = data.get("rawSlip") or {}
 
-        # จำ QR ทันทีเมื่อ EasySlip ตอบ success
-        # เพื่อครั้งถัดไปไม่ต้องยิง API ซ้ำ
-        remember_verified_qr(qr_payload, data, "success")
+        # EasySlip อาจส่ง payload กลับมา แม้ local decode ไม่ได้
+        final_payload = (
+            qr_payload
+            or str(raw.get("payload") or "").strip()
+        )
+
+        # จำ cache หลัง EasySlip success
+        if final_payload:
+            remember_verified_qr(final_payload, data, "success")
+        remember_verified_image(image_bytes, data)
 
         if data.get("isDuplicate") is True:
             reply_line(reply_token, [error_flex("duplicate_slip")])
@@ -2207,7 +2389,6 @@ def handle_image(event: dict):
             reply_line(reply_token, [error_flex("account_not_match")])
             return
 
-        # กัน transRef ซ้ำอีกชั้นด้วย SQLite
         if not claim_trans_ref(data):
             reply_line(reply_token, [error_flex("duplicate_slip")])
             return
@@ -2215,7 +2396,7 @@ def handle_image(event: dict):
         reply_line(reply_token, [success_flex(data)])
         return
 
-    # Error จาก EasySlip
+    # EasySlip ตอบ error
     code, detail = normalize_easyslip_error(result)
 
     alias = {
@@ -2226,6 +2407,17 @@ def handle_image(event: dict):
         "slip_pending": "slip_pending",
     }
     code = alias.get(code, code)
+
+    # ถ้ามี QR แต่ EasySlip บอกว่าไม่ใช่สลิป/อ่านไม่ได้:
+    # ไม่ต้องตอบ error ให้รูปทั่วไปดูรก
+    if code in {
+        "slip_not_found",
+        "qrcode_not_found",
+        "invalid_image_format",
+        "validation_error",
+    }:
+        print(f"[SLIP] EasySlip rejected QR image silently: {code} {detail}")
+        return
 
     reply_line(reply_token, [error_flex(code, detail)])
 
