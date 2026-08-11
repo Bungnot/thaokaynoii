@@ -1316,7 +1316,8 @@ def _peh_parse_status(item: str):
 
     # ต่อให้พิมพ์ 3, 5, 10 ตัว ก็แสดงสูงสุด 2 ตัว
     symbol_count = min(2, max(1, raw.count(symbol)))
-    display_text = f"{clean_text} {symbol * symbol_count}".strip()
+    # ไม่ใส่ space ระหว่างข้อความกับ emoji เพื่อกัน LINE ตัดบรรทัด
+    display_text = f"{clean_text}{symbol * symbol_count}"
 
     return symbol, display_text
 
@@ -1325,10 +1326,10 @@ def _peh_parse_status(item: str):
 def _peh_split_row(display_text: str, symbol: str | None):
     """
     แยกข้อความสำหรับแสดงในตาราง:
-      "เทสระบบ3 320 ✅✅"
+      "เทสระบบ3 320❌❌"
     เป็น
       left  = "เทสระบบ3"
-      right = "320 ✅✅"
+      right = "320❌❌"
 
     รองรับตัวเลขเช่น 320, 1,250, 320.50
     ถ้าไม่พบตัวเลขท้ายข้อความ จะให้ข้อความทั้งหมดอยู่ฝั่งซ้าย
@@ -1337,7 +1338,7 @@ def _peh_split_row(display_text: str, symbol: str | None):
     text = str(display_text or "").strip()
 
     # ตัด emoji สถานะออกชั่วคราว เพื่อหาเลขท้าย
-    clean = re.sub(r"[✅❌⛔]+", "", text)
+    clean = re.sub(r"[✅❌⛔️\ufe0f]+", "", text)
     clean = re.sub(r"\s+", " ", clean).strip()
 
     m = re.match(r"^(.*?)(?:\s+)([-+]?\d[\d,]*(?:\.\d+)?)$", clean)
