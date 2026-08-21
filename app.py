@@ -1357,6 +1357,13 @@ def _peh_split_row(display_text: str, symbol: str | None):
     clean = re.sub(r"[✅❌⛔️\ufe0f]+", "", text)
     clean = re.sub(r"\s+", " ", clean).strip()
 
+    # ตัด suffix ซ้ำ เช่น " (2)", " (3)" ออกก่อนหาตัวเลข แล้วเก็บไว้ใส่ฝั่งซ้ายคืน
+    dup_suffix = ""
+    dup_m = re.search(r"\s*\(\d+\)$", clean)
+    if dup_m:
+        dup_suffix = dup_m.group(0)
+        clean = clean[: dup_m.start()]
+
     m = re.match(r"^(.*?)(?:\s+)([-+]?\d[\d,]*(?:\.\d+)?)$", clean)
 
     emoji_text = ""
@@ -1365,13 +1372,13 @@ def _peh_split_row(display_text: str, symbol: str | None):
         emoji_text = symbol * count
 
     if m:
-        left = m.group(1).strip()
+        left = m.group(1).strip() + dup_suffix
         amount = m.group(2).strip()
         # ติดเลขกับ emoji ไม่มีช่องว่าง เพื่อกัน LINE ตัดบรรทัดระหว่างกัน
         right = f"{amount}{emoji_text}" if emoji_text else amount
         return left, right
 
-    return clean, emoji_text
+    return (clean + dup_suffix).strip(), emoji_text
 
 
 def _peh_build_stats(items):
