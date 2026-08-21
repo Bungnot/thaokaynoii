@@ -2119,9 +2119,10 @@ def handle_text(event: dict):
                 [text_message(f'🗑️ ลบรายการที่ {del_no} แล้ว\n\u201c{removed}\u201d\n\n(ไม่มีรายการเหลือแล้ว)')]
             )
         else:
-            msgs = [text_message(f'🗑️ ลบรายการที่ {del_no} แล้ว\n\u201c{removed}\u201d')]
-            msgs += peh_flex_messages(event)
-            reply_line(reply_token, msgs[:5])
+            reply_line(
+                reply_token,
+                [text_message(f'🗑️ ลบรายการที่ {del_no} แล้ว\n\u201c{removed}\u201d')]
+            )
         return
 
     # ====== ล้างรายการ PEH (เฉพาะแอดมิน) ======
