@@ -1259,13 +1259,29 @@ def _source_key(event: dict) -> str:
 
 
 def _add_peh_item(event: dict, text: str):
-    """เพิ่มรายการ PEH ลงในห้อง/กลุ่ม/แชทนั้น ๆ"""
+    """
+    เพิ่มรายการ PEH ลงในห้อง/กลุ่ม/แชทนั้น ๆ
+    หากชื่อซ้ำจะใส่ (2), (3), (4)... ต่อท้ายอัตโนมัติ
+    """
     key = _source_key(event)
 
     if key not in PEH_LIST:
         PEH_LIST[key] = []
 
-    PEH_LIST[key].append(text)
+    # ตรวจสอบชื่อซ้ำ: เปรียบเทียบแบบ case-sensitive ตรงๆ
+    existing = PEH_LIST[key]
+
+    # สร้าง set ของรายการที่มีอยู่แล้ว (ข้อความดิบ)
+    existing_set = set(existing)
+
+    # ถ้าชื่อซ้ำ ให้ใส่ (2), (3), ... ต่อท้าย
+    candidate = text
+    counter = 2
+    while candidate in existing_set:
+        candidate = f"{text} ({counter})"
+        counter += 1
+
+    PEH_LIST[key].append(candidate)
     return PEH_LIST[key]
 
 
@@ -2055,6 +2071,51 @@ def handle_text(event: dict):
         if added:
             reply_line(reply_token, peh_flex_messages(event))
             return
+
+    # ====== คำสั่ง "ลบ <ตัวเลข>" ลบรายการสกอตามหมายเลข (เฉพาะแอดมิน) ======
+    m_delete = re.match(r"^ลบ\s+(\d+)$", text)
+    if m_delete:
+        if not is_admin:
+            reply_line(
+                reply_token,
+                [text_message("⛔ คำสั่งลบรายการ ใช้ได้เฉพาะแอดมินเท่านั้น")]
+            )
+            return
+
+        key = _source_key(event)
+        items = PEH_LIST.get(key, [])
+        del_no = int(m_delete.group(1))
+
+        if not items:
+            reply_line(
+                reply_token,
+                [text_message("📋 ยังไม่มีรายการเปะในห้องนี้")]
+            )
+            return
+
+        if del_no < 1 or del_no > len(items):
+            reply_line(
+                reply_token,
+                [text_message(
+                    f"❌ ไม่มีรายการที่ {del_no}\n"
+                    f"มีรายการทั้งหมด {len(items)} รายการ"
+                )]
+            )
+            return
+
+        removed = items.pop(del_no - 1)
+        PEH_LIST[key] = items
+
+        if not items:
+            reply_line(
+                reply_token,
+                [text_message(f'🗑️ ลบรายการที่ {del_no} แล้ว\n\u201c{removed}\u201d\n\n(ไม่มีรายการเหลือแล้ว)')]
+            )
+        else:
+            msgs = [text_message(f'🗑️ ลบรายการที่ {del_no} แล้ว\n\u201c{removed}\u201d')]
+            msgs += peh_flex_messages(event)
+            reply_line(reply_token, msgs[:5])
+        return
 
     # ====== ล้างรายการ PEH (เฉพาะแอดมิน) ======
     if text == "ล้างรายการ" and is_admin:
