@@ -1293,11 +1293,11 @@ PEH_STATUS = {
 }
 
 # จำนวนรายการต่อ 1 หน้าใน Carousel
-# 30 รายการ/หน้า => 120 รายการ = 4 หน้า
-PEH_ITEMS_PER_PAGE = 30
+# 20 รายการ/หน้า x 6 หน้า = 120 รายการ/carousel
+PEH_ITEMS_PER_PAGE = 20
 
-# LINE Carousel รองรับสูงสุด 12 bubbles ต่อ 1 carousel
-PEH_MAX_BUBBLES_PER_CAROUSEL = 12
+# จำกัด 6 bubbles/carousel เพื่อให้ JSON ไม่เกิน 50 KB (ข้อจำกัด LINE)
+PEH_MAX_BUBBLES_PER_CAROUSEL = 6
 
 
 def _peh_parse_status(item: str):
@@ -1707,10 +1707,10 @@ def peh_flex_messages(event: dict) -> list:
     """
     คืนค่าเป็น list ของ Flex messages
 
-    - 30 รายการ / bubble
-    - สูงสุด 12 bubbles / carousel
-    - 120 รายการ = 4 bubbles ใน Flex เดียว
-    - ถ้าเกิน 360 รายการ จะตัดเป็น Flex carousel ชุดถัดไปอัตโนมัติ
+    - 20 รายการ / bubble
+    - สูงสุด 6 bubbles / carousel (JSON ไม่เกิน 50 KB)
+    - 120 รายการ = 6 bubbles ใน Flex เดียว
+    - ถ้าเกิน 120 รายการ จะตัดเป็น Flex carousel ชุดถัดไปอัตโนมัติ
     """
     key = _source_key(event)
     items = PEH_LIST.get(key, [])
