@@ -563,6 +563,27 @@ def reply_line(reply_token: str, messages: list):
     return resp
 
 
+def push_line(to: str, messages: list):
+    """ส่ง push message (ไม่ต้องใช้ replyToken)"""
+    url = "https://api.line.me/v2/bot/message/push"
+    payload = {
+        "to": to,
+        "messages": messages[:5],
+    }
+
+    resp = requests.post(
+        url,
+        headers=line_headers(),
+        json=payload,
+        timeout=15,
+    )
+
+    if not resp.ok:
+        print("[LINE] push failed:", resp.status_code, resp.text)
+
+    return resp
+
+
 def text_message(text: str) -> dict:
     return {
         "type": "text",
@@ -1293,11 +1314,13 @@ PEH_STATUS = {
 }
 
 # จำนวนรายการต่อ 1 หน้าใน Carousel
-# 20 รายการ/หน้า x 6 หน้า = 120 รายการ/carousel
+# 20 รายการ/หน้า × 4 หน้า × 2 carousel = 120 รายการ
 PEH_ITEMS_PER_PAGE = 20
 
-# จำกัด 6 bubbles/carousel เพื่อให้ JSON ไม่เกิน 50 KB (ข้อจำกัด LINE)
-PEH_MAX_BUBBLES_PER_CAROUSEL = 6
+# LINE Carousel รองรับสูงสุด 12 bubbles ต่อ 1 carousel
+# แต่จำกัดไว้ที่ 4 bubbles (~40KB) เพื่อไม่เกิน 50KB
+# 2 carousel × 4 bubbles × 20 items = 160 รายการสูงสุด
+PEH_MAX_BUBBLES_PER_CAROUSEL = 4
 
 
 def _peh_parse_status(item: str):
@@ -2053,8 +2076,11 @@ def handle_text(event: dict):
             )
             return
 
-        # peh_flex_messages จะจัด 20 รายการ/หน้าให้อัตโนมัติ
-        reply_line(reply_token, peh_flex_messages(event))
+        messages = peh_flex_messages(event)
+        # reply รับได้สูงสุด 5 messages; push ส่วนที่เหลือ (ถ้ามี)
+        reply_line(reply_token, messages[:5])
+        if len(messages) > 5:
+            push_line(key, messages[5:])
         return
 
     # ====== PEH / "เปะ" (เฉพาะแอดมิน) ======
@@ -2076,7 +2102,10 @@ def handle_text(event: dict):
                 added = True
 
         if added:
-            reply_line(reply_token, peh_flex_messages(event))
+            messages = peh_flex_messages(event)
+            reply_line(reply_token, messages[:5])
+            if len(messages) > 5:
+                push_line(_source_key(event), messages[5:])
             return
 
     # ====== คำสั่ง "ลบ <ตัวเลข>" ลบรายการสกอตามหมายเลข (เฉพาะแอดมิน) ======
