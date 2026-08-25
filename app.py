@@ -1320,7 +1320,7 @@ PEH_ITEMS_PER_PAGE = 20
 # LINE Carousel รองรับสูงสุด 12 bubbles ต่อ 1 carousel
 # แต่จำกัดไว้ที่ 4 bubbles (~40KB) เพื่อไม่เกิน 50KB
 # 2 carousel × 4 bubbles × 20 items = 160 รายการสูงสุด
-PEH_MAX_BUBBLES_PER_CAROUSEL = 4
+PEH_MAX_BUBBLES_PER_CAROUSEL = 6
 
 
 def _peh_parse_status(item: str):
@@ -1447,12 +1447,7 @@ def _peh_stat_cell(title: str, value: int, emoji: str) -> dict:
 
 
 def _peh_row(number: int, display_text: str, symbol: str | None) -> dict:
-    """
-    ตารางแบบมือถือ:
-      [ลำดับ] [ชื่อ/ข้อความ]                         [ตัวเลข + emoji]
-
-    ตัวเลขยอดและ emoji จะชิดขวาสุดของตาราง
-    """
+    """slim row — ตัด field ที่ไม่จำเป็นออกเพื่อลดขนาด JSON ให้ 6 bubble อยู่ใน 50KB"""
     number_color = {
         "✅": "#15803D",
         "❌": "#B91C1C",
@@ -1464,15 +1459,11 @@ def _peh_row(number: int, display_text: str, symbol: str | None) -> dict:
     return {
         "type": "box",
         "layout": "horizontal",
-        "paddingTop": "5px",
-        "paddingBottom": "5px",
-        "alignItems": "center",
         "contents": [
             {
                 "type": "text",
                 "text": str(number),
                 "size": "xs",
-                "weight": "bold",
                 "color": number_color,
                 "align": "center",
                 "flex": 1,
@@ -1481,22 +1472,16 @@ def _peh_row(number: int, display_text: str, symbol: str | None) -> dict:
                 "type": "text",
                 "text": left_text,
                 "size": "xs",
-                "color": "#24313A",
                 "wrap": True,
-                "gravity": "center",
                 "flex": 5,
             },
             {
                 "type": "text",
                 "text": right_text,
                 "size": "xs",
-                "weight": "bold",
                 "color": "#24313A",
                 "align": "end",
-                "gravity": "center",
                 "flex": 4,
-                "wrap": False,
-                "adjustMode": "shrink-to-fit",
             },
         ],
     }
@@ -1516,10 +1501,7 @@ def _peh_page_bubble(page_items, page_no: int, page_total: int, stats: dict, tot
         rows.append(_peh_row(global_no, display_text, symbol))
 
         if idx != len(page_items) - 1:
-            rows.append({
-                "type": "separator",
-                "color": "#EEF2F4",
-            })
+            rows.append({"type": "separator"})
 
     if not rows:
         rows = [{
@@ -2076,11 +2058,7 @@ def handle_text(event: dict):
             )
             return
 
-        messages = peh_flex_messages(event)
-        # reply รับได้สูงสุด 5 messages; push ส่วนที่เหลือ (ถ้ามี)
-        reply_line(reply_token, messages[:5])
-        if len(messages) > 5:
-            push_line(key, messages[5:])
+        reply_line(reply_token, peh_flex_messages(event))
         return
 
     # ====== PEH / "เปะ" (เฉพาะแอดมิน) ======
@@ -2102,10 +2080,7 @@ def handle_text(event: dict):
                 added = True
 
         if added:
-            messages = peh_flex_messages(event)
-            reply_line(reply_token, messages[:5])
-            if len(messages) > 5:
-                push_line(_source_key(event), messages[5:])
+            reply_line(reply_token, peh_flex_messages(event))
             return
 
     # ====== คำสั่ง "ลบ <ตัวเลข>" ลบรายการสกอตามหมายเลข (เฉพาะแอดมิน) ======
