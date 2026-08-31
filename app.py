@@ -653,13 +653,43 @@ def download_line_image(message_id: str) -> bytes:
     return resp.content
 
 
+# เลขบัญชีปลายทางที่ยอมรับ (ตัดขีด/ช่องว่างออกเพื่อเปรียบเทียบ)
+_VALID_ACCOUNT_NUMBERS = {
+    re.sub(r"[\-\s]", "", acc["number"])
+    for acc in ACCOUNTS
+}
+
+
+def _account_matches_ours(data: dict) -> bool:
+    """
+    ตรวจว่า receiver ในสลิปตรงกับบัญชีใดบัญชีหนึ่งของเรา
+    เปรียบเทียบโดยตัด - และช่องว่างออก
+    """
+    raw = (data.get("rawSlip") or {})
+    receiver = raw.get("receiver") or {}
+    account = receiver.get("account") or {}
+    # EasySlip V2 อาจส่งเป็น proxy, number, หรือ accountNo
+    number_raw = (
+        str(account.get("number") or "")
+        or str(account.get("proxy", {}).get("value") if isinstance(account.get("proxy"), dict) else "") 
+        or str(receiver.get("accountNo") or "")
+    ).strip()
+    number_clean = re.sub(r"[\-\s]", "", number_raw)
+
+    if not number_clean:
+        # ถ้า EasySlip ไม่ส่งเลขบัญชีมา ให้ fallback ใช้ matchedAccount เดิม
+        return data.get("matchedAccount") is not None
+
+    return number_clean in _VALID_ACCOUNT_NUMBERS
+
+
 def verify_with_easyslip(image_bytes: bytes) -> dict:
     """
     EasySlip API V2:
       POST https://api.easyslip.com/v2/verify/bank
       multipart/form-data:
         image
-        matchAccount=true
+        matchAccount=false  (เราตรวจเองในโค้ด เพื่อรองรับหลายบัญชี)
         checkDuplicate=true
     """
     headers = {
@@ -672,7 +702,7 @@ def verify_with_easyslip(image_bytes: bytes) -> dict:
 
     form = {
         "checkDuplicate": "true",
-        "matchAccount": "true" if VERIFY_MATCH_ACCOUNT else "false",
+        "matchAccount": "false",   # ปิด — ตรวจบัญชีเองใน _account_matches_ours()
         "remark": "LINE BOT เถ้าแก่น้อย",
     }
 
@@ -2286,8 +2316,8 @@ def handle_image(event: dict):
             reply_line(reply_token, [error_flex("duplicate_slip")])
             return
 
-        # When matchAccount=true, require a matched account.
-        if VERIFY_MATCH_ACCOUNT and data.get("matchedAccount") is None:
+        # ตรวจว่าสลิปโอนมายังบัญชีใดบัญชีหนึ่งของเรา (รองรับ 2 บัญชี)
+        if VERIFY_MATCH_ACCOUNT and not _account_matches_ours(data):
             reply_line(reply_token, [error_flex("account_not_match")])
             return
 
