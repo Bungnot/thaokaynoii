@@ -707,7 +707,7 @@ def verify_with_easyslip(image_bytes: bytes) -> dict:
     }
 
     last_exc = None
-    for attempt in range(1, 4):   # retry สูงสุด 3 ครั้ง
+    for attempt in range(1, 3):   # retry สูงสุด 2 ครั้ง (ปกติครั้งแรกสำเร็จ)
         try:
             resp = requests.post(
                 EASYSLIP_VERIFY_URL,
@@ -716,16 +716,24 @@ def verify_with_easyslip(image_bytes: bytes) -> dict:
                     "image": ("slip.jpg", image_bytes, "image/jpeg"),
                 },
                 data=form,
-                timeout=(10, 60),   # connect=10s, read=60s
+                timeout=(8, 20),   # connect=8s, read=20s (ลดจาก 60s)
             )
+            # ถ้า EasySlip ตอบ 5xx ให้ retry ครั้งที่ 2 ทันที ไม่ sleep
+            if resp.status_code >= 500:
+                last_exc = Exception(f"EasySlip HTTP {resp.status_code}")
+                print(f"[EasySlip] server error {resp.status_code} attempt {attempt}/2, retrying...")
+                continue
+
             try:
                 payload = resp.json()
             except ValueError:
+                # ถ้าตอบ HTML หรือ non-JSON ให้แสดงข้อความที่อ่านได้ แทนการ dump HTML ดิบ
+                status = resp.status_code
                 payload = {
                     "success": False,
                     "error": {
-                        "code": "EASYSLIP_INVALID_RESPONSE",
-                        "message": resp.text[:500] or "EasySlip response is not JSON",
+                        "code": "easyslip_unavailable",
+                        "message": f"EasySlip ตอบกลับผิดรูปแบบ (HTTP {status})\nกรุณาส่งสลิปซ้ำอีกครั้ง 🔄",
                     },
                 }
             payload["_http_status"] = resp.status_code
@@ -733,12 +741,11 @@ def verify_with_easyslip(image_bytes: bytes) -> dict:
 
         except requests.Timeout as exc:
             last_exc = exc
-            print(f"[EasySlip] timeout attempt {attempt}/3, retrying...")
-            time.sleep(1.5 * attempt)   # back-off: 1.5s, 3s
+            print(f"[EasySlip] timeout attempt {attempt}/2, retrying...")
+            # ไม่ sleep — retry ทันที
         except requests.RequestException as exc:
             last_exc = exc
-            print(f"[EasySlip] request error attempt {attempt}/3: {exc}")
-            time.sleep(1.0)
+            print(f"[EasySlip] request error attempt {attempt}/2: {exc}")
 
     raise last_exc
 
@@ -1057,6 +1064,10 @@ def error_flex(code: str, detail: str = "") -> dict:
 
     # กรณีวันสลิปไม่ตรง ใช้รายละเอียดแบบไดนามิกเพื่อบอกทั้งวันสลิปและวันนี้
     if normalized == "slip_wrong_date" and detail:
+        desc = detail
+
+    # ถ้ามี detail ส่งมาพร้อม duplicate_slip ให้ override desc (กรณีส่งซ้ำด้วยตัวเอง)
+    if normalized == "duplicate_slip" and detail:
         desc = detail
 
     # Dedicated copy for duplicate / wrong-date slips
@@ -2354,7 +2365,12 @@ def handle_image(event: dict):
 
         # Optional second duplicate-protection layer using SQLite.
         if not claim_trans_ref(data):
-            push_line(user_id, [error_flex("duplicate_slip")])
+            # สลิปนี้บอทเคยบันทึกแล้ว (ลูกค้าส่งซ้ำเพราะรอนาน)
+            # ให้แจ้งว่ารับสลิปแล้ว ไม่ต้องส่งซ้ำ
+            push_line(user_id, [error_flex(
+                "duplicate_slip",
+                "✅ สลิปนี้ได้รับการยืนยันแล้ว\nไม่จำเป็นต้องส่งซ้ำอีกครั้ง"
+            )])
             return
 
         push_line(user_id, [success_flex(data)])
