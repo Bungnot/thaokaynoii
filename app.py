@@ -31,11 +31,41 @@ EASYSLIP_API_KEY = os.getenv("EASYSLIP_API_KEY", "").strip()
 # EasySlip V2
 EASYSLIP_VERIFY_URL = "https://api.easyslip.com/v2/verify/bank"
 
-# Account shown by command "บช"
-ACCOUNT_NUMBER = os.getenv("TARGET_ACCOUNT_NUMBER", "0748441328").strip()
-ACCOUNT_BANK = os.getenv("TARGET_ACCOUNT_BANK", "กสิกรไทย").strip()
-ACCOUNT_BANK_SHORT = os.getenv("TARGET_ACCOUNT_BANK_SHORT", "KBANK").strip()
-ACCOUNT_NAME = os.getenv("TARGET_ACCOUNT_NAME", "กิตติเชษฐ์ บุญอินทร์").strip()
+# Account shown by command "บช" (สลับไปเรื่อยๆ ทุกครั้งที่ลูกค้าพิม)
+ACCOUNTS = [
+    {
+        "number": "074-843-7118",
+        "bank": "กสิกรไทย",
+        "bank_short": "KBANK",
+        "name": "ธนะวัฒน์ ครองยุติ",
+    },
+    {
+        "number": "020480908233",
+        "bank": "ออมสิน",
+        "bank_short": "GSB",
+        "name": "ครรชิต ครองยุติ",
+    },
+]
+
+# ตัวนับสำหรับสลับบัญชี (thread-safe)
+_ACCOUNT_INDEX = 0
+_ACCOUNT_INDEX_LOCK = threading.Lock()
+
+
+def get_next_account() -> dict:
+    """คืนบัญชีถัดไปแบบ round-robin (thread-safe)"""
+    global _ACCOUNT_INDEX
+    with _ACCOUNT_INDEX_LOCK:
+        acc = ACCOUNTS[_ACCOUNT_INDEX % len(ACCOUNTS)]
+        _ACCOUNT_INDEX += 1
+    return acc
+
+
+# ค่า backward-compat (ใช้ใน verify_with_easyslip / ACCOUNT_MESSAGE เดิม)
+ACCOUNT_NUMBER = ACCOUNTS[0]["number"]
+ACCOUNT_BANK = ACCOUNTS[0]["bank"]
+ACCOUNT_BANK_SHORT = ACCOUNTS[0]["bank_short"]
+ACCOUNT_NAME = ACCOUNTS[0]["name"]
 
 # EasySlip V2 Account Matching
 VERIFY_MATCH_ACCOUNT = os.getenv("VERIFY_MATCH_ACCOUNT", "true").lower() == "true"
@@ -591,14 +621,21 @@ def text_message(text: str) -> dict:
     }
 
 
-ACCOUNT_MESSAGE = f"""━━━━━━━━━━━━━━
-🏦 แจ้งเลขบัญชีฝากเงิน
-🔢 เลขบัญชี : {ACCOUNT_NUMBER}
-🏛 ธนาคาร : {ACCOUNT_BANK}
-👤 ชื่อบัญชี : {ACCOUNT_NAME}
-━━━━━━━━━━━━━━
-⚠️ เพื่อป้องกันมิจฉาชีพ
-ชื่อผู้ฝาก-ถอน ต้องเป็นชื่อเดียวกันเท่านั้น ✅"""
+def build_account_message(acc: dict) -> str:
+    return (
+        f"━━━━━━━━━━━━━━\n"
+        f"🏦 แจ้งเลขบัญชีฝากเงิน\n"
+        f"🔢 เลขบัญชี : {acc['number']}\n"
+        f"🏛 ธนาคาร : {acc['bank']}\n"
+        f"👤 ชื่อบัญชี : {acc['name']}\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"⚠️ เพื่อป้องกันมิจฉาชีพ\n"
+        f"ชื่อผู้ฝาก-ถอน ต้องเป็นชื่อเดียวกันเท่านั้น ✅"
+    )
+
+
+# backward-compat (ใช้จุดอื่นที่อ้าง ACCOUNT_MESSAGE โดยตรง)
+ACCOUNT_MESSAGE = build_account_message(ACCOUNTS[0])
 
 
 def download_line_image(message_id: str) -> bytes:
@@ -2136,12 +2173,16 @@ def handle_text(event: dict):
         reply_line(reply_token, [text_message("ล้างรายการเรียบร้อย")])
         return
 
-    # ====== คำสั่งเดิม ======
-    if text == "บช":
+    # ====== คำสั่ง บช (สลับบัญชีทุกครั้ง) ======
+    _BCC_KEYWORDS = re.compile(
+        r"^(บช|บันชี|บัญชี|บันขี|เลขบัญชี|เลข\.บัญชี|เลขบันชี|บัณชี|ขอบัญชี|ลบช)$"
+    )
+    if _BCC_KEYWORDS.match(text):
+        acc = get_next_account()
         reply_line(
             reply_token,
             [
-                text_message(ACCOUNT_MESSAGE),
+                text_message(build_account_message(acc)),
                 account_send_slip_flex()
             ]
         )
