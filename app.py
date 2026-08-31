@@ -2300,12 +2300,16 @@ def handle_image(event: dict):
         reply_line(reply_token, [error_flex("image_size_too_large")])
         return
 
+    # ตอบ "กำลังตรวจสลิป..." ทันที ก่อนเรียก EasySlip (ซึ่งอาจช้า)
+    # replyToken ใช้ได้ครั้งเดียว จากนี้ใช้ push_line แทน
+    reply_line(reply_token, [text_message("🔍 กำลังตรวจสอบสลิป กรุณารอสักครู่...")])
+
     try:
         result = verify_with_easyslip(image_bytes)
     except requests.Timeout as exc:
         print("[EasySlip] timeout after 3 retries:", exc)
         reply_line(
-            reply_token,
+            user_id,
             [error_flex(
                 "easyslip_unavailable",
                 "ระบบตรวจสลิปใช้เวลานานเกินไป\nกรุณาส่งสลิปซ้ำอีกครั้ง 🔄"
@@ -2315,7 +2319,7 @@ def handle_image(event: dict):
     except requests.RequestException as exc:
         print("[EasySlip] request error:", exc)
         reply_line(
-            reply_token,
+            user_id,
             [error_flex(
                 "easyslip_unavailable",
                 "เชื่อมต่อระบบตรวจสลิปไม่สำเร็จ\nกรุณาส่งสลิปซ้ำอีกครั้ง 🔄"
@@ -2333,27 +2337,27 @@ def handle_image(event: dict):
         is_today, date_detail = validate_slip_is_today(data)
         if not is_today:
             reply_line(
-                reply_token,
+                user_id,
                 [error_flex("slip_wrong_date", date_detail)],
             )
             return
 
         # EasySlip can expose isDuplicate in success data.
         if data.get("isDuplicate") is True:
-            reply_line(reply_token, [error_flex("duplicate_slip")])
+            push_line(user_id, [error_flex("duplicate_slip")])
             return
 
         # ตรวจว่าสลิปโอนมายังบัญชีใดบัญชีหนึ่งของเรา (รองรับ 2 บัญชี)
         if VERIFY_MATCH_ACCOUNT and not _account_matches_ours(data):
-            reply_line(reply_token, [error_flex("account_not_match")])
+            push_line(user_id, [error_flex("account_not_match")])
             return
 
         # Optional second duplicate-protection layer using SQLite.
         if not claim_trans_ref(data):
-            reply_line(reply_token, [error_flex("duplicate_slip")])
+            push_line(user_id, [error_flex("duplicate_slip")])
             return
 
-        reply_line(reply_token, [success_flex(data)])
+        push_line(user_id, [success_flex(data)])
         return
 
     # บาง error response ของ EasySlip อาจแนบ data/rawSlip กลับมาด้วย
@@ -2363,7 +2367,7 @@ def handle_image(event: dict):
         is_today, date_detail = validate_slip_is_today(error_data)
         if not is_today:
             reply_line(
-                reply_token,
+                user_id,
                 [error_flex("slip_wrong_date", date_detail)],
             )
             return
@@ -2381,7 +2385,7 @@ def handle_image(event: dict):
     }
     code = alias.get(code, code)
 
-    reply_line(reply_token, [error_flex(code, detail)])
+    push_line(user_id, [error_flex(code, detail)])
 
 
 # =========================
