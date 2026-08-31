@@ -80,7 +80,7 @@ MAX_IMAGE_BYTES = 4 * 1024 * 1024
 # กันลูกค้าส่งหลายรูปติดกันในแชท 1-1 แล้วกินโควต้า EasySlip หลายครั้ง
 # จะตรวจเฉพาะรูปแรกในช่วงเวลานี้ รูปถัดไปจะเงียบและไม่เรียก EasySlip
 try:
-    PRIVATE_IMAGE_BURST_SECONDS = max(1.0, float(os.getenv("PRIVATE_IMAGE_BURST_SECONDS", "10")))
+    PRIVATE_IMAGE_BURST_SECONDS = max(1.0, float(os.getenv("PRIVATE_IMAGE_BURST_SECONDS", "90")))
 except (TypeError, ValueError):
     PRIVATE_IMAGE_BURST_SECONDS = 10.0
 
@@ -706,27 +706,41 @@ def verify_with_easyslip(image_bytes: bytes) -> dict:
         "remark": "LINE BOT เถ้าแก่น้อย",
     }
 
-    resp = requests.post(
-        EASYSLIP_VERIFY_URL,
-        headers=headers,
-        files=files,
-        data=form,
-        timeout=30,
-    )
+    last_exc = None
+    for attempt in range(1, 4):   # retry สูงสุด 3 ครั้ง
+        try:
+            resp = requests.post(
+                EASYSLIP_VERIFY_URL,
+                headers=headers,
+                files={
+                    "image": ("slip.jpg", image_bytes, "image/jpeg"),
+                },
+                data=form,
+                timeout=(10, 60),   # connect=10s, read=60s
+            )
+            try:
+                payload = resp.json()
+            except ValueError:
+                payload = {
+                    "success": False,
+                    "error": {
+                        "code": "EASYSLIP_INVALID_RESPONSE",
+                        "message": resp.text[:500] or "EasySlip response is not JSON",
+                    },
+                }
+            payload["_http_status"] = resp.status_code
+            return payload
 
-    try:
-        payload = resp.json()
-    except ValueError:
-        payload = {
-            "success": False,
-            "error": {
-                "code": "EASYSLIP_INVALID_RESPONSE",
-                "message": resp.text[:500] or "EasySlip response is not JSON",
-            },
-        }
+        except requests.Timeout as exc:
+            last_exc = exc
+            print(f"[EasySlip] timeout attempt {attempt}/3, retrying...")
+            time.sleep(1.5 * attempt)   # back-off: 1.5s, 3s
+        except requests.RequestException as exc:
+            last_exc = exc
+            print(f"[EasySlip] request error attempt {attempt}/3: {exc}")
+            time.sleep(1.0)
 
-    payload["_http_status"] = resp.status_code
-    return payload
+    raise last_exc
 
 
 def normalize_easyslip_error(payload: dict):
@@ -2288,11 +2302,24 @@ def handle_image(event: dict):
 
     try:
         result = verify_with_easyslip(image_bytes)
+    except requests.Timeout as exc:
+        print("[EasySlip] timeout after 3 retries:", exc)
+        reply_line(
+            reply_token,
+            [error_flex(
+                "easyslip_unavailable",
+                "ระบบตรวจสลิปใช้เวลานานเกินไป\nกรุณาส่งสลิปซ้ำอีกครั้ง 🔄"
+            )],
+        )
+        return
     except requests.RequestException as exc:
         print("[EasySlip] request error:", exc)
         reply_line(
             reply_token,
-            [error_flex("easyslip_unavailable", "เชื่อมต่อ EasySlip ไม่สำเร็จ กรุณาลองใหม่")],
+            [error_flex(
+                "easyslip_unavailable",
+                "เชื่อมต่อระบบตรวจสลิปไม่สำเร็จ\nกรุณาส่งสลิปซ้ำอีกครั้ง 🔄"
+            )],
         )
         return
 
