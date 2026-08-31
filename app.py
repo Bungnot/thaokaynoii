@@ -52,13 +52,17 @@ _ACCOUNT_INDEX = 0
 _ACCOUNT_INDEX_LOCK = threading.Lock()
 
 
-def get_next_account() -> dict:
-    """คืนบัญชีถัดไปแบบ round-robin (thread-safe)"""
+def get_accounts_ordered() -> list:
+    """
+    คืนบัญชีทั้ง 2 ใบ โดยสลับลำดับทุกครั้งที่ถูกเรียก (thread-safe)
+    ครั้งคี่  → [กสิกร, ออมสิน]
+    ครั้งคู่  → [ออมสิน, กสิกร]
+    """
     global _ACCOUNT_INDEX
     with _ACCOUNT_INDEX_LOCK:
-        acc = ACCOUNTS[_ACCOUNT_INDEX % len(ACCOUNTS)]
+        idx = _ACCOUNT_INDEX % len(ACCOUNTS)
         _ACCOUNT_INDEX += 1
-    return acc
+    return ACCOUNTS[idx:] + ACCOUNTS[:idx]
 
 
 # ค่า backward-compat (ใช้ใน verify_with_easyslip / ACCOUNT_MESSAGE เดิม)
@@ -2178,11 +2182,28 @@ def handle_text(event: dict):
         r"^(บช|บันชี|บัญชี|บันขี|เลขบัญชี|เลข\.บัญชี|เลขบันชี|บัณชี|ขอบัญชี|ลบช)$"
     )
     if _BCC_KEYWORDS.match(text):
-        acc = get_next_account()
+        ordered = get_accounts_ordered()  # [บัญชีแรก, บัญชีที่สอง] (สลับลำดับทุกครั้ง)
+        combined = (
+            f"━━━━━━━━━━━━━━\n"
+            f"🏦 แจ้งเลขบัญชีฝากเงิน\n"
+            f"━━━━━━━━━━━━━━\n"
+            f"🔢 บัญชีที่ 1\n"
+            f"   เลขบัญชี : {ordered[0]['number']}\n"
+            f"   ธนาคาร   : {ordered[0]['bank']}\n"
+            f"   ชื่อบัญชี : {ordered[0]['name']}\n"
+            f"━━━━━━━━━━━━━━\n"
+            f"🔢 บัญชีที่ 2\n"
+            f"   เลขบัญชี : {ordered[1]['number']}\n"
+            f"   ธนาคาร   : {ordered[1]['bank']}\n"
+            f"   ชื่อบัญชี : {ordered[1]['name']}\n"
+            f"━━━━━━━━━━━━━━\n"
+            f"⚠️ เพื่อป้องกันมิจฉาชีพ\n"
+            f"ชื่อผู้ฝาก-ถอน ต้องเป็นชื่อเดียวกันเท่านั้น ✅"
+        )
         reply_line(
             reply_token,
             [
-                text_message(build_account_message(acc)),
+                text_message(combined),
                 account_send_slip_flex()
             ]
         )
