@@ -702,7 +702,7 @@ def verify_with_easyslip(image_bytes: bytes) -> dict:
 
     form = {
         "checkDuplicate": "true",
-        "matchAccount": "false",   # ปิด — ตรวจบัญชีเองใน _account_matches_ours()
+        "matchAccount": "true",    # ให้ EasySlip ตรวจ — ต้องลงทะเบียน 2 บัญชีใน Dashboard
         "remark": "LINE BOT เถ้าแก่น้อย",
     }
 
