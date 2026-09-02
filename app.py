@@ -31,27 +31,11 @@ EASYSLIP_API_KEY = os.getenv("EASYSLIP_API_KEY", "").strip()
 # EasySlip V2
 EASYSLIP_VERIFY_URL = "https://api.easyslip.com/v2/verify/bank"
 
-# ======= 2 บัญชีสำหรับรับเงิน (สลับลำดับทุกครั้งที่พิม บช) =======
-ACCOUNTS = [
-    {"number": "074-843-7118", "bank": "กสิกรไทย", "name": "ธนะวัฒน์ ครองยุติ"},
-    {"number": "020480908233", "bank": "ออมสิน",   "name": "ครรชิต ครองยุติ"},
-]
-_ACCOUNT_INDEX = 0
-_ACCOUNT_INDEX_LOCK = threading.Lock()
-
-def get_accounts_ordered() -> list:
-    """คืน 2 บัญชีโดยสลับลำดับทุกครั้ง (thread-safe)"""
-    global _ACCOUNT_INDEX
-    with _ACCOUNT_INDEX_LOCK:
-        idx = _ACCOUNT_INDEX % len(ACCOUNTS)
-        _ACCOUNT_INDEX += 1
-    return ACCOUNTS[idx:] + ACCOUNTS[:idx]
-
-# backward-compat
-ACCOUNT_NUMBER = ACCOUNTS[0]["number"]
-ACCOUNT_BANK   = ACCOUNTS[0]["bank"]
-ACCOUNT_BANK_SHORT = "KBANK"
-ACCOUNT_NAME   = ACCOUNTS[0]["name"]
+# Account shown by command "บช"
+ACCOUNT_NUMBER = os.getenv("TARGET_ACCOUNT_NUMBER", "0748441328").strip()
+ACCOUNT_BANK = os.getenv("TARGET_ACCOUNT_BANK", "กสิกรไทย").strip()
+ACCOUNT_BANK_SHORT = os.getenv("TARGET_ACCOUNT_BANK_SHORT", "KBANK").strip()
+ACCOUNT_NAME = os.getenv("TARGET_ACCOUNT_NAME", "กิตติเชษฐ์ บุญอินทร์").strip()
 
 # EasySlip V2 Account Matching
 VERIFY_MATCH_ACCOUNT = os.getenv("VERIFY_MATCH_ACCOUNT", "true").lower() == "true"
@@ -2152,28 +2136,15 @@ def handle_text(event: dict):
         reply_line(reply_token, [text_message("ล้างรายการเรียบร้อย")])
         return
 
-    # ====== คำสั่ง บช (แสดง 2 บัญชี สลับลำดับทุกครั้ง) ======
-    _BCC_RE = re.compile(r"^(บช|บันชี|บัญชี|เลข|บชมา|บันขี|เลขบัญชี|เลข[.]บัญชี|เลขบันชี|บัณชี|ขอบัญชี|ลบช)$")
-    if _BCC_RE.match(text):
-        ordered = get_accounts_ordered()
-        msg = (
-            f"━━━━━━━━━━━━━━\n"
-            f"🏦 แจ้งเลขบัญชีฝากเงิน\n"
-            f"━━━━━━━━━━━━━━\n"
-            f"🔢 บัญชีที่ 1\n"
-            f"   เลขบัญชี : {ordered[0]['number']}\n"
-            f"   ธนาคาร   : {ordered[0]['bank']}\n"
-            f"   ชื่อบัญชี : {ordered[0]['name']}\n"
-            f"━━━━━━━━━━━━━━\n"
-            f"🔢 บัญชีที่ 2\n"
-            f"   เลขบัญชี : {ordered[1]['number']}\n"
-            f"   ธนาคาร   : {ordered[1]['bank']}\n"
-            f"   ชื่อบัญชี : {ordered[1]['name']}\n"
-            f"━━━━━━━━━━━━━━\n"
-            f"⚠️ เพื่อป้องกันมิจฉาชีพ\n"
-            f"ชื่อผู้ฝาก-ถอน ต้องเป็นชื่อเดียวกันเท่านั้น ✅"
+    # ====== คำสั่งเดิม ======
+    if text == "บช":
+        reply_line(
+            reply_token,
+            [
+                text_message(ACCOUNT_MESSAGE),
+                account_send_slip_flex()
+            ]
         )
-        reply_line(reply_token, [text_message(msg), account_send_slip_flex()])
         return
 
 
@@ -2223,60 +2194,75 @@ def handle_image(event: dict):
         reply_line(reply_token, [error_flex("image_size_too_large")])
         return
 
-    # ตอบ "กำลังตรวจ..." ทันที แล้วรัน EasySlip ใน background thread
-    # เพื่อไม่ให้ลูกค้ารอนาน
-    reply_line(reply_token, [text_message("🔍 กำลังตรวจสอบสลิป กรุณารอสักครู่...")])
+    try:
+        result = verify_with_easyslip(image_bytes)
+    except requests.RequestException as exc:
+        print("[EasySlip] request error:", exc)
+        reply_line(
+            reply_token,
+            [error_flex("easyslip_unavailable", "เชื่อมต่อ EasySlip ไม่สำเร็จ กรุณาลองใหม่")],
+        )
+        return
 
-    def _verify_and_push():
-        try:
-            result = verify_with_easyslip(image_bytes)
-        except requests.RequestException as exc:
-            print("[EasySlip] request error:", exc)
-            push_line(user_id, [error_flex("easyslip_unavailable", "เชื่อมต่อ EasySlip ไม่สำเร็จ กรุณาลองใหม่")])
+    # EasySlip V2 success
+    if result.get("success") is True:
+        data = result.get("data") or {}
+
+        # ====== รับเฉพาะสลิปของ “วันนี้” ตามเวลาไทย ======
+        # ต้องเช็กก่อน isDuplicate / claim_trans_ref เพื่อให้สลิปคนละวัน
+        # ถูกแจ้งว่า “ไม่ใช่ของวันนี้” และไม่ถูกบันทึกว่าใช้งานแล้วในฐานข้อมูลบอท
+        is_today, date_detail = validate_slip_is_today(data)
+        if not is_today:
+            reply_line(
+                reply_token,
+                [error_flex("slip_wrong_date", date_detail)],
+            )
             return
 
-        if result.get("success") is True:
-            data = result.get("data") or {}
-
-            is_today, date_detail = validate_slip_is_today(data)
-            if not is_today:
-                push_line(user_id, [error_flex("slip_wrong_date", date_detail)])
-                return
-
-            if data.get("isDuplicate") is True:
-                push_line(user_id, [error_flex("duplicate_slip")])
-                return
-
-            if VERIFY_MATCH_ACCOUNT and data.get("matchedAccount") is None:
-                push_line(user_id, [error_flex("account_not_match")])
-                return
-
-            if not claim_trans_ref(data):
-                push_line(user_id, [error_flex("duplicate_slip")])
-                return
-
-            push_line(user_id, [success_flex(data)])
+        # EasySlip can expose isDuplicate in success data.
+        if data.get("isDuplicate") is True:
+            reply_line(reply_token, [error_flex("duplicate_slip")])
             return
 
-        error_data = result.get("data") or {}
-        if isinstance(error_data, dict) and ((error_data.get("rawSlip") or {}).get("date")):
-            is_today, date_detail = validate_slip_is_today(error_data)
-            if not is_today:
-                push_line(user_id, [error_flex("slip_wrong_date", date_detail)])
-                return
+        # When matchAccount=true, require a matched account.
+        if VERIFY_MATCH_ACCOUNT and data.get("matchedAccount") is None:
+            reply_line(reply_token, [error_flex("account_not_match")])
+            return
 
-        code, detail = normalize_easyslip_error(result)
-        alias = {
-            "slip_not_found": "slip_not_found",
-            "qrcode_not_found": "qrcode_not_found",
-            "invalid_image_format": "invalid_image_format",
-            "image_size_too_large": "image_size_too_large",
-            "slip_pending": "slip_pending",
-        }
-        code = alias.get(code, code)
-        push_line(user_id, [error_flex(code, detail)])
+        # Optional second duplicate-protection layer using SQLite.
+        if not claim_trans_ref(data):
+            reply_line(reply_token, [error_flex("duplicate_slip")])
+            return
 
-    threading.Thread(target=_verify_and_push, daemon=True).start()
+        reply_line(reply_token, [success_flex(data)])
+        return
+
+    # บาง error response ของ EasySlip อาจแนบ data/rawSlip กลับมาด้วย
+    # ถ้ามีวันที่สลิปและเป็นคนละวัน ให้กติกา “วันนี้เท่านั้น” มาก่อน error อื่น
+    error_data = result.get("data") or {}
+    if isinstance(error_data, dict) and ((error_data.get("rawSlip") or {}).get("date")):
+        is_today, date_detail = validate_slip_is_today(error_data)
+        if not is_today:
+            reply_line(
+                reply_token,
+                [error_flex("slip_wrong_date", date_detail)],
+            )
+            return
+
+
+    code, detail = normalize_easyslip_error(result)
+
+    # Support uppercase error codes from some V2 responses.
+    alias = {
+        "slip_not_found": "slip_not_found",
+        "qrcode_not_found": "qrcode_not_found",
+        "invalid_image_format": "invalid_image_format",
+        "image_size_too_large": "image_size_too_large",
+        "slip_pending": "slip_pending",
+    }
+    code = alias.get(code, code)
+
+    reply_line(reply_token, [error_flex(code, detail)])
 
 
 # =========================
