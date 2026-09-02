@@ -1791,7 +1791,7 @@ def account_send_slip_flex() -> dict:
         "altText": "กดที่นี่เพื่อขอบัญชี",
         "contents": {
             "type": "bubble",
-            "size": "micro",
+            "size": "kilo",
             "body": {
                 "type": "box",
                 "layout": "vertical",
