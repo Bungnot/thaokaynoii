@@ -1784,12 +1784,11 @@ SLIP_SEND_URL = "https://page.line.me/812anmhp"
 
 def account_send_slip_flex() -> dict:
     """
-    FLEX ปุ่มส่งสลิปแบบกะทัดรัด แต่กว้างพอให้เห็นคำว่า
-    'ส่งสลิปที่นี่' ครบถ้วนบนมือถือ
+    FLEX ปุ่มกะทัดรัด สำหรับให้กดไปขอบัญชีใน DM
     """
     return {
         "type": "flex",
-        "altText": "📤 ส่งสลิปที่นี่",
+        "altText": "กดที่นี่เพื่อขอบัญชี",
         "contents": {
             "type": "bubble",
             "size": "micro",
@@ -1806,7 +1805,7 @@ def account_send_slip_flex() -> dict:
                         "color": "#06C755",
                         "action": {
                             "type": "uri",
-                            "label": "ส่งสลิปที่นี่",
+                            "label": "กดที่นี่เพื่อขอบัญชี",
                             "uri": SLIP_SEND_URL
                         }
                     }
@@ -2138,13 +2137,22 @@ def handle_text(event: dict):
 
     # ====== คำสั่งเดิม ======
     if text == "บช":
-        reply_line(
-            reply_token,
-            [
-                text_message(ACCOUNT_MESSAGE),
-                account_send_slip_flex()
-            ]
-        )
+        source_type = str((event.get("source") or {}).get("type") or "").lower()
+        if source_type == "user":
+            # แชทส่วนตัว → ส่งเลขบัญชี + ปุ่มส่งสลิป
+            reply_line(
+                reply_token,
+                [
+                    text_message(ACCOUNT_MESSAGE),
+                    account_send_slip_flex()
+                ]
+            )
+        else:
+            # กลุ่ม / ห้อง → ส่งแค่ปุ่ม ไม่แสดงเลขบัญชี
+            reply_line(
+                reply_token,
+                [account_send_slip_flex()]
+            )
         return
 
 
