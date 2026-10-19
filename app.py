@@ -32,10 +32,10 @@ EASYSLIP_API_KEY = os.getenv("EASYSLIP_API_KEY", "").strip()
 EASYSLIP_VERIFY_URL = "https://api.easyslip.com/v2/verify/bank"
 
 # Account shown by command "บช"
-ACCOUNT_NUMBER = os.getenv("TARGET_ACCOUNT_NUMBER", "0748441328").strip()
-ACCOUNT_BANK = os.getenv("TARGET_ACCOUNT_BANK", "กสิกรไทย").strip()
-ACCOUNT_BANK_SHORT = os.getenv("TARGET_ACCOUNT_BANK_SHORT", "KBANK").strip()
-ACCOUNT_NAME = os.getenv("TARGET_ACCOUNT_NAME", "กิตติเชษฐ์ บุญอินทร์").strip()
+ACCOUNT_NUMBER = os.getenv("TARGET_ACCOUNT_NUMBER", "9778789082").strip()
+ACCOUNT_BANK = os.getenv("TARGET_ACCOUNT_BANK", "กรุงเทพ").strip()
+ACCOUNT_BANK_SHORT = os.getenv("TARGET_ACCOUNT_BANK_SHORT", "BBL").strip()
+ACCOUNT_NAME = os.getenv("TARGET_ACCOUNT_NAME", "ธนะวัฒน์ ครองยุติ").strip()
 
 # EasySlip V2 Account Matching
 VERIFY_MATCH_ACCOUNT = os.getenv("VERIFY_MATCH_ACCOUNT", "true").lower() == "true"
